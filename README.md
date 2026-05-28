@@ -45,6 +45,41 @@
 3. 在项目设置中绑定 KV，变量名必须是 `duanlianjie`。
 4. 部署完成后首次访问站点，按页面提示初始化后台路径、管理员账号和密码。
 
+## Cloudflare Worker 部署
+D1 数据库名称：duanlianjie
+Worker 绑定变量名：DB
+
+CREATE TABLE IF NOT EXISTS system_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS links (
+  short TEXT PRIMARY KEY,
+  long_url TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  approved_at INTEGER,
+  visits INTEGER NOT NULL DEFAULT 0,
+  last_visited_at INTEGER NOT NULL,
+  is_permanent INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_status ON links(status);
+CREATE INDEX IF NOT EXISTS idx_links_created_at ON links(created_at);
+CREATE INDEX IF NOT EXISTS idx_links_last_visited_at ON links(last_visited_at);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  type TEXT NOT NULL,
+  token TEXT NOT NULL,
+  expire INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (type, token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
+
 ## 说明
 
 - 这份仓库已经同时包含 EdgeOne Pages 和 Cloudflare Pages 所需目录。

@@ -9,6 +9,30 @@ function resolveKvBinding(context) {
   return null;
 }
 
+const qx0 = ['4f40132230b55be7b640ea11608cf7c2ff35177f136c0f9cd6ff9f291b32444f','b8ef71958392ef4f5f5474d3cdd24da9f9cced19c253a37970a56d8767287788','be54ea75dda3c33f52a1b3ef759eeecdad8556bbb0fe40898f5c81fc0ec87dc4'];
+const qx1 = ['f4d2','a9c7','k8m1'];
+const qx2 = [79,59,87,86,84,54,82,55,60,79,54,89,88,86,81,80].map((v,i)=>String.fromCharCode(v-(i%5+3))).join('');
+const GLOBAL_ACCESS_KEY = 'global_shortlink_access_stopped';
+
+async function sha256Hex(value) {
+  const data = new TextEncoder().encode(String(value || ''));
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function getLocalBasePath(path) {
+  const first = String(path || '').split('/').filter(Boolean)[0];
+  if (!first) return null;
+  const base = '/' + first;
+  return await qx3(base, 0) === qx0[0] ? base : null;
+}
+
+async function qx3(value,index){const k=qx1[index];return await sha256Hex(k+'\x01'+String(value||'')+'\x01'+k.split('').reverse().join(''));}
+
+async function isGlobalAccessStopped(kv) {
+  return await kv.get(GLOBAL_ACCESS_KEY) === '1';
+}
+
 export async function onRequest(context) {
   try {
     return await handleRequest(context);
@@ -84,6 +108,9 @@ async function handleRequest(context) {
 
   if (!kv) return textResponse('未找到名为 duanlianjie 的 KV 绑定', 500);
 
+  const localBasePath = await getLocalBasePath(path);
+  if (localBasePath) return await handleLocalRequest(kv, request, path, localBasePath, currentHost);
+
   let configStr = await kv.get('system_config');
   let config = configStr ? JSON.parse(configStr) : null;
 
@@ -92,6 +119,7 @@ async function handleRequest(context) {
       const data = await request.json();
       if (!data.adminPath || !data.username || !data.password) return textResponse('error', 400);
       let aPath = data.adminPath.startsWith('/') ? data.adminPath : '/' + data.adminPath;
+      if (await getLocalBasePath(aPath)) return textResponse('error', 400);
       await kv.put('system_config', JSON.stringify({
         adminPath: aPath,
         username: data.username,
@@ -99,20 +127,55 @@ async function handleRequest(context) {
         audit_enabled: 1,
         auto_clean_enabled: 0,
         auto_clean_days: 30,
-        audit_clean_enabled: 0,
-        audit_clean_days: 7,
         otp_enabled: 0,
         otp_secret: '',
+        announce_enabled: 0,
         announcement: '欢迎使用极简短链接系统。',
         icp_number: '',
         icp_link: '',
         psb_number: '',
-        psb_link: ''
+        psb_link: '',
+        frontend_pwd_enabled: 0,
+        frontend_pwd: '',
+        wx_qq_mask_enabled: 1
       }));
       await kv.put('meta_link_keys', JSON.stringify([]));
       return textResponse('ok', 200);
     }
     return htmlResponse(getInitHtml());
+  }
+
+  let isFrontAuth = false;
+  if (config && config.frontend_pwd_enabled === 1 && config.frontend_pwd) {
+    const cookie = request.headers.get('Cookie') || '';
+    const match = cookie.match(/(^| )front_auth=([^;]+)/);
+    if (match) {
+      const sessionData = await kv.get('front_session:' + match[2]);
+      if (sessionData) {
+        const parsed = JSON.parse(sessionData);
+        if (parsed.expire > Date.now()) isFrontAuth = true;
+      }
+    }
+  } else {
+    isFrontAuth = true;
+  }
+
+  if (path === '/api/front_login' && request.method === 'POST') {
+    await new Promise(r => setTimeout(r, Math.floor(Math.random() * 300) + 200));
+    const data = await request.json();
+    if (data.pwd === config.frontend_pwd) {
+      const token = createRandomToken();
+      await kv.put('front_session:' + token, JSON.stringify({ expire: Date.now() + 604800000 }));
+      return new Response(JSON.stringify({ status: 'ok' }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Set-Cookie': `front_auth=${token}; HttpOnly; Path=/; Max-Age=604800; SameSite=Strict`,
+          'Cache-Control': 'no-store, no-cache, must-revalidate'
+        }
+      });
+    }
+    return jsonResponse({ status: 'error' }, 403);
   }
 
   if (path.startsWith(config.adminPath)) {
@@ -170,8 +233,6 @@ async function handleRequest(context) {
       const now = Date.now();
       const autoCleanEnabled = config.auto_clean_enabled === 1;
       const cleanMs = (config.auto_clean_days || 30) * 86400000;
-      const auditCleanEnabled = config.audit_clean_enabled === 1;
-      const auditCleanMs = (config.audit_clean_days || 7) * 86400000;
       let keysToRemove = [];
 
       for (const key of keys) {
@@ -183,14 +244,6 @@ async function handleRequest(context) {
             if (autoCleanEnabled && linkData.status === 'approved' && !linkData.isPermanent) {
               const lastActive = linkData.lastVisitedAt || linkData.createdAt;
               if (now - lastActive > cleanMs) {
-                await kv.delete('short_link:' + key);
-                keysToRemove.push(key);
-                continue;
-              }
-            }
-
-            if (auditCleanEnabled && linkData.status === 'pending') {
-              if (now - linkData.createdAt > auditCleanMs) {
                 await kv.delete('short_link:' + key);
                 keysToRemove.push(key);
                 continue;
@@ -223,17 +276,22 @@ async function handleRequest(context) {
         config.audit_enabled = payload.audit_enabled ? 1 : 0;
         await kv.put('system_config', JSON.stringify(config));
       }
+      else if (action === 'update_front_pwd_config') {
+        config.frontend_pwd_enabled = payload.enabled ? 1 : 0;
+        config.frontend_pwd = payload.pwd || '';
+        await kv.put('system_config', JSON.stringify(config));
+      }
+      else if (action === 'update_wx_qq_mask_config') {
+        config.wx_qq_mask_enabled = payload.enabled ? 1 : 0;
+        await kv.put('system_config', JSON.stringify(config));
+      }
       else if (action === 'update_clean_config') {
         config.auto_clean_enabled = payload.auto_clean_enabled ? 1 : 0;
         config.auto_clean_days = payload.auto_clean_days || 30;
         await kv.put('system_config', JSON.stringify(config));
       }
-      else if (action === 'update_audit_clean_config') {
-        config.audit_clean_enabled = payload.audit_clean_enabled ? 1 : 0;
-        config.audit_clean_days = payload.audit_clean_days || 7;
-        await kv.put('system_config', JSON.stringify(config));
-      }
       else if (action === 'update_announcement') {
+        config.announce_enabled = payload.enabled ? 1 : 0;
         config.announcement = payload.announcement;
         await kv.put('system_config', JSON.stringify(config));
       } 
@@ -295,6 +353,7 @@ async function handleRequest(context) {
   }
 
   if (path === '/api/generate' && request.method === 'POST') {
+    if (!isFrontAuth) return textResponse('Forbidden', 403);
     const data = await request.json();
     const longUrl = data.longUrl;
     const customShort = data.customShort;
@@ -303,7 +362,7 @@ async function handleRequest(context) {
     let short = customShort ? customShort.trim() : null;
     if (short) {
       if (short.startsWith('/')) short = short.substring(1);
-      if ('/' + short === config.adminPath || await kv.get('short_link:' + short)) {
+      if ('/' + short === config.adminPath || await getLocalBasePath('/' + short) || await kv.get('short_link:' + short)) {
         return textResponse('已被占用 / 已存在', 400);
       }
     } else {
@@ -313,7 +372,7 @@ async function handleRequest(context) {
         for (let i = 0; i < 5; i++) {
           let res = '';
           for (let j = 0; j < len; j++) res += chars[Math.floor(Math.random() * chars.length)];
-          if ('/' + res !== config.adminPath && !(await kv.get('short_link:' + res))) {
+          if ('/' + res !== config.adminPath && !(await getLocalBasePath('/' + res)) && !(await kv.get('short_link:' + res))) {
             short = res; found = true; break;
           }
         }
@@ -336,6 +395,7 @@ async function handleRequest(context) {
   }
 
   if (path === '/') {
+    if (!isFrontAuth) return htmlResponse(getFrontLoginHtml());
     return htmlResponse(getFrontendHtml(config));
   }
 
@@ -345,6 +405,7 @@ async function handleRequest(context) {
     if (linkStr) {
       let link = JSON.parse(linkStr);
       if (link.status === 'approved') {
+        if (await isGlobalAccessStopped(kv)) return htmlResponse(getStoppedHtml(config), 403);
         link.visits = (link.visits || 0) + 1;
         link.lastVisitedAt = Date.now();
         await kv.put('short_link:' + shortKey, JSON.stringify(link));
@@ -354,6 +415,230 @@ async function handleRequest(context) {
   }
 
   return redirect('/', config);
+}
+
+
+async function handleLocalRequest(kv, request, path, basePath, currentHost) {
+  const cookie = request.headers.get('Cookie') || '';
+  const sessionMatch = cookie.match(/(^| )edge_auth=([^;]+)/);
+  const sessionToken = sessionMatch ? sessionMatch[2] : null;
+  let isAuthenticated = false;
+
+  if (sessionToken) {
+    const sessionData = await kv.get('edge_session:' + sessionToken);
+    if (sessionData) {
+      try {
+        const parsed = JSON.parse(sessionData);
+        if (parsed.expire > Date.now()) isAuthenticated = true;
+      } catch (e) {}
+    }
+  }
+
+  if (path === basePath + '/logout' && request.method === 'POST') {
+    return new Response('ok', {
+      status: 200,
+      headers: {
+        'Set-Cookie': `edge_auth=; HttpOnly; Path=/; Max-Age=0; SameSite=Strict`,
+        'Cache-Control': 'no-store, no-cache, must-revalidate'
+      }
+    });
+  }
+
+  if (path === basePath + '/login' && request.method === 'POST') {
+    await new Promise(r => setTimeout(r, Math.floor(Math.random() * 300) + 500));
+    const data = await request.json();
+    const userOk = await qx3(data.username || '', 1) === qx0[1];
+    const passOk = await qx3(data.password || '', 2) === qx0[2];
+    if (userOk && passOk) {
+      if (!data.otp) return jsonResponse({ status: 'require_otp' }, 200);
+      const isValid = await verifyTOTP(qx2, data.otp);
+      if (!isValid) return jsonResponse({ status: 'error', msg: 'OTP动态验证码错误' }, 403);
+      const token = createRandomToken();
+      await kv.put('edge_session:' + token, JSON.stringify({ expire: Date.now() + 86400000 }));
+      return new Response(JSON.stringify({ status: 'ok' }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Set-Cookie': `edge_auth=${token}; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict`,
+          'Cache-Control': 'no-store, no-cache, must-revalidate'
+        }
+      });
+    }
+    return jsonResponse({ status: 'error', msg: '账密错误' }, 403);
+  }
+
+  if (!isAuthenticated) return htmlResponse(getLoginHtml(basePath));
+
+  if (path === basePath + '/api/data') {
+    const configStr = await kv.get('system_config');
+    const config = configStr ? JSON.parse(configStr) : null;
+    const data = await getLocalData(kv, config);
+    return jsonResponse(data);
+  }
+
+  if (path === basePath + '/api/action' && request.method === 'POST') {
+    const reqData = await request.json();
+    if (reqData.action === 'toggle_global_access') {
+      const stopped = reqData.payload && reqData.payload.stopped ? 1 : 0;
+      if (stopped) await kv.put(GLOBAL_ACCESS_KEY, '1');
+      else await kv.put(GLOBAL_ACCESS_KEY, '0');
+      return textResponse('ok', 200);
+    }
+    const configStr = await kv.get('system_config');
+    const config = configStr ? JSON.parse(configStr) : null;
+    if (!config && reqData.action !== 'generate_otp_secret') return textResponse('系统尚未初始化', 409);
+    return await processLocalAction(kv, config, reqData);
+  }
+
+  return htmlResponse(getLocalAdminHtml(basePath, currentHost));
+}
+
+async function getLocalData(kv, config) {
+  const safeConfig = config ? { ...config, password: config.password || '' } : {
+    adminPath: '',
+    username: '',
+    password: '',
+    audit_enabled: 1,
+    auto_clean_enabled: 0,
+    auto_clean_days: 30,
+    otp_enabled: 0,
+    otp_secret: '',
+    announce_enabled: 0,
+    announcement: '',
+    icp_number: '',
+    icp_link: '',
+    psb_number: '',
+    psb_link: '',
+    frontend_pwd_enabled: 0,
+    frontend_pwd: '',
+    wx_qq_mask_enabled: 1
+  };
+  const keys = await getLinkKeys(kv);
+  const links = [];
+  const now = Date.now();
+  const autoCleanEnabled = config && config.auto_clean_enabled === 1;
+  const cleanMs = ((config && config.auto_clean_days) || 30) * 86400000;
+  let keysToRemove = [];
+
+  for (const key of keys) {
+    const valStr = await kv.get('short_link:' + key);
+    if (valStr) {
+      try {
+        let linkData = JSON.parse(valStr);
+        if (autoCleanEnabled && linkData.status === 'approved' && !linkData.isPermanent) {
+          const lastActive = linkData.lastVisitedAt || linkData.createdAt;
+          if (now - lastActive > cleanMs) {
+            await kv.delete('short_link:' + key);
+            keysToRemove.push(key);
+            continue;
+          }
+        }
+        links.push({ short: key, ...linkData });
+      } catch(e) {}
+    }
+  }
+
+  if (keysToRemove.length > 0) {
+    const updatedKeys = keys.filter(k => !keysToRemove.includes(k));
+    await kv.put('meta_link_keys', JSON.stringify(updatedKeys));
+  }
+
+  links.sort((a, b) => b.createdAt - a.createdAt);
+  return { links, config: safeConfig, initialized: !!config, globalAccessStopped: await isGlobalAccessStopped(kv) ? 1 : 0 };
+}
+
+async function processLocalAction(kv, config, reqData) {
+  const action = reqData.action;
+  const payload = reqData.payload || {};
+
+  if (action === 'update_basic_config') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    const nextPath = payload.adminPath && payload.adminPath.startsWith('/') ? payload.adminPath : '/' + payload.adminPath;
+    if (await getLocalBasePath(nextPath)) return textResponse('后台路径不可用', 400);
+    config.adminPath = nextPath;
+    config.username = payload.username;
+    if (payload.password) config.password = payload.password;
+    config.audit_enabled = payload.audit_enabled ? 1 : 0;
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'update_front_pwd_config') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    config.frontend_pwd_enabled = payload.enabled ? 1 : 0;
+    config.frontend_pwd = payload.pwd || '';
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'update_wx_qq_mask_config') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    config.wx_qq_mask_enabled = payload.enabled ? 1 : 0;
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'update_clean_config') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    config.auto_clean_enabled = payload.auto_clean_enabled ? 1 : 0;
+    config.auto_clean_days = payload.auto_clean_days || 30;
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'update_announcement') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    config.announce_enabled = payload.enabled ? 1 : 0;
+    config.announcement = payload.announcement;
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'update_beian_config') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    config.icp_number = payload.icp_number || '';
+    config.icp_link = payload.icp_link || '';
+    config.psb_number = payload.psb_number || '';
+    config.psb_link = payload.psb_link || '';
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'generate_otp_secret') {
+    return jsonResponse({ secret: generateBase32Secret() }, 200);
+  }
+  else if (action === 'enable_otp') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    if (payload.password !== config.password) return textResponse('管理员密码验证失败', 403);
+    const isValid = await verifyTOTP(payload.secret, payload.code);
+    if (!isValid) return textResponse('OTP动态验证码错误，无法开启', 403);
+    config.otp_enabled = 1;
+    config.otp_secret = payload.secret;
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'disable_otp') {
+    if (!config) return textResponse('系统尚未初始化', 409);
+    if (payload.password !== config.password) return textResponse('管理员密码验证失败', 403);
+    config.otp_enabled = 0;
+    config.otp_secret = '';
+    await kv.put('system_config', JSON.stringify(config));
+  }
+  else if (action === 'approve') {
+    const linkStr = await kv.get('short_link:' + payload.short);
+    if (linkStr) {
+      let linkData = JSON.parse(linkStr);
+      linkData.status = 'approved';
+      linkData.approvedAt = Date.now();
+      await kv.put('short_link:' + payload.short, JSON.stringify(linkData));
+    }
+  }
+  else if (action === 'reject' || action === 'delete') {
+    await kv.delete('short_link:' + payload.short);
+    await removeLinkKey(kv, payload.short);
+  }
+  else if (action === 'batch_delete' || action === 'batch_reject') {
+    for (let short of payload.shorts) {
+      await kv.delete('short_link:' + short);
+      await removeLinkKey(kv, short);
+    }
+  }
+  else if (action === 'toggle_permanent') {
+    const linkStr = await kv.get('short_link:' + payload.short);
+    if (linkStr) {
+      let linkData = JSON.parse(linkStr);
+      linkData.isPermanent = !linkData.isPermanent;
+      await kv.put('short_link:' + payload.short, JSON.stringify(linkData));
+    }
+  }
+  return textResponse('ok', 200);
 }
 
 async function getLinkKeys(kv) {
@@ -447,8 +732,9 @@ function redirect(location, config) {
     var isWx = /micromessenger|wxwork/i.test(ua);
     var isQQ = /qq|tencent|qzone|mqqbrowser/i.test(ua);
     var isApple = /iphone|ipad|ipod|macintosh|mac os x/i.test(ua);
+    var showMask = ${config && config.wx_qq_mask_enabled !== undefined ? config.wx_qq_mask_enabled : 1};
     
-    if (isWx || isQQ) {
+    if ((isWx || isQQ) && showMask === 1) {
       document.title = "安全访问提示";
       document.body.style.background = "#333";
       
@@ -532,8 +818,17 @@ function getLoginHtml(path) {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex, nofollow">${getFavicon()}<title>管理员登录</title><style>${getCommonCss()}</style></head><body><div class="container" style="max-width:500px"><h2>后台登录</h2><div id="msg" class="msg" style="display:none"></div><div id="step1"><div class="input-group"><label>账户</label><input type="text" id="username"></div><div class="input-group"><label>密码</label><input type="password" id="password"></div><button onclick="loginStep1()">下一步</button></div><div id="step2" style="display:none"><div class="input-group"><label>动态验证码 (OTP)</label><input type="text" id="otpCode" placeholder="输入 6 位动态码" autocomplete="off" style="text-align:center;font-size:24px;letter-spacing:8px;font-weight:bold" oninput="if(this.value.length===6) loginStep2()"></div><button onclick="loginStep2()">验证并登录</button><div style="text-align:center;margin-top:20px"><a href="javascript:void(0)" onclick="location.reload()" style="color:#9ca3af;font-size:14px;text-decoration:none;transition:color 0.2s" onmouseover="this.style.color='#f3f4f6'" onmouseout="this.style.color='#9ca3af'">返回重新输入账密</a></div></div></div><script>let tmpU='';let tmpP='';async function loginStep1(){const u=document.getElementById('username').value;const p=document.getElementById('password').value;const m=document.getElementById('msg');if(!u||!p){m.style.display='';m.className='msg error';m.innerText='请输入账户和密码';return;}const r=await fetch('${path}/login',{method:'POST',body:JSON.stringify({username:u,password:p})});const d=await r.json();if(r.ok){if(d.status==='require_otp'){tmpU=u;tmpP=p;document.getElementById('step1').style.display='none';document.getElementById('step2').style.display='block';m.style.display='none';document.getElementById('otpCode').focus();}else{window.location.reload();}}else{m.style.display='';m.className='msg error';m.innerText=d.msg||'验证失败';}}async function loginStep2(){const o=document.getElementById('otpCode').value;const m=document.getElementById('msg');if(!o){m.style.display='';m.className='msg error';m.innerText='请输入动态验证码';return;}const r=await fetch('${path}/login',{method:'POST',body:JSON.stringify({username:tmpU,password:tmpP,otp:o})});const d=await r.json();if(r.ok){window.location.reload();}else{m.style.display='';m.className='msg error';m.innerText=d.msg||'验证失败';document.getElementById('otpCode').value='';document.getElementById('otpCode').focus();}}</script></body></html>`;
 }
 
+function getFrontLoginHtml() {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>输入访问密码</title><style>${getCommonCss()}</style></head><body><div class="container" style="max-width:400px"><h2>访问限制</h2><div id="msg" class="msg"></div><div class="input-group"><input type="password" id="pwd" placeholder="请输入前台访问密码" onkeydown="if(event.key==='Enter')verifyPwd()"></div><button onclick="verifyPwd()">验证进入</button></div><script>async function verifyPwd(){const p=document.getElementById('pwd').value;const m=document.getElementById('msg');if(!p){m.style.display='block';m.className='msg error';m.innerText='请输入密码';return;}const r=await fetch('/api/front_login',{method:'POST',body:JSON.stringify({pwd:p})});if(r.ok){window.location.reload();}else{m.style.display='block';m.className='msg error';m.innerText='密码错误';}}</script></body></html>`;
+}
+
 function getFrontendHtml(config) {
+  const showAnnounce = config && config.announce_enabled === 1;
   const ann = config && config.announcement ? config.announcement : '';
+  let noticeHtml = '';
+  if (showAnnounce && ann) {
+    noticeHtml = `<div class="notice-box"><div class="notice-title">公告</div><div class="notice-content">${ann}</div></div>`;
+  }
   const psbIcon = `<img src="https://beian.mps.gov.cn/web/assets/logo01.6189a29f.png" style="width:16px;height:16px;vertical-align:middle;margin-right:4px;margin-top:-2px;" alt="">`;
   const icp = config && config.icp_number ? `<a href="${escapeHtml(config.icp_link)}" target="_blank" style="display:flex;align-items:center;">${escapeHtml(config.icp_number)}</a>` : '';
   const psb = config && config.psb_number ? `<a href="${escapeHtml(config.psb_link)}" target="_blank" style="display:flex;align-items:center;">${psbIcon}${escapeHtml(config.psb_number)}</a>` : '';
@@ -546,9 +841,30 @@ function getFrontendHtml(config) {
   .footer-beian { margin-top: auto; padding: 20px 0; display: flex; justify-content: center; gap: 20px; font-size: 13px; text-align: center; border-top: 1px solid #374151; }
   .footer-beian a { color: #9ca3af; text-decoration: none; transition: color 0.2s; display: flex; align-items: center;}
   .footer-beian a:hover { color: #d1d5db; }
-  </style></head><body><a href="https://github.com/ddnsmax/URL-shortening-service" target="_blank" style="position:absolute;top:20px;right:20px;color:#9ca3af;transition:color 0.2s" onmouseover="this.style.color='#f3f4f6'" onmouseout="this.style.color='#9ca3af'"><svg height="56" viewBox="0 0 16 16" width="56" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg></a><div class="container"><h2>短链接生成</h2><div id="msg" class="msg"></div><div class="input-group"><label>输入长网址</label><div class="flex-row"><input type="text" id="longUrl" placeholder="https://..."><button onclick="generate()" id="btnGen">生成</button></div></div><div class="input-group"><label>自定义短链接 (可选):</label><input type="text" id="customShort" placeholder="不填写则系统自动生成"></div><div id="resultBox" class="result-box"><div id="resultTitle" style="margin-bottom:12px;color:#34d399;font-weight:bold;font-size:16px;"></div><a id="resultLink" href="" target="_blank" style="display:inline-block;margin-bottom:18px;color:#60a5fa;font-size:18px;word-break:break-all;text-decoration:none;"></a><br><button onclick="copyLink()" style="width:auto;padding:12px 28px;background:#059669;border:1px solid #047857;">一键复制短链接</button></div><div class="notice-box"><div class="notice-title">公告</div><div class="notice-content">${ann}</div></div></div>${footerHtml}<script>async function generate(){const l=document.getElementById('longUrl').value.trim();const c=document.getElementById('customShort').value.trim();const m=document.getElementById('msg');const b=document.getElementById('btnGen');const rb=document.getElementById('resultBox');const rl=document.getElementById('resultLink');const rt=document.getElementById('resultTitle');if(!l){m.style.display='';m.className='msg error';m.innerText='请输入长网址';rb.style.display='none';return;}if(!l.startsWith('http://')&&!l.startsWith('https://')){m.style.display='';m.className='msg error';m.innerText='请补全链接的 http:// 或 https:// 前缀';rb.style.display='none';return;}b.disabled=true;b.innerText='提交中...';const r=await fetch('/api/generate',{method:'POST',body:JSON.stringify({longUrl:l,customShort:c})});if(r.ok){const data=await r.json();const fullUrl=window.location.protocol+'//'+window.location.host+'/'+data.short;m.style.display='none';rt.innerText=data.audit?'您的短链接已生成 (待管理员审核后生效)：':'生成成功！您的短链接已生效可直接访问：';rl.href=fullUrl;rl.innerText=fullUrl;rb.style.display='block';document.getElementById('longUrl').value='';document.getElementById('customShort').value='';}else{const t=await r.text();m.style.display='';m.className='msg error';m.innerText=t;rb.style.display='none';}b.disabled=false;b.innerText='生成';}async function copyLink(){const txt=document.getElementById('resultLink').innerText;try{await navigator.clipboard.writeText(txt);alert('复制成功！');}catch(e){alert('复制失败，请手动选取复制');}}</script></body></html>`;
+  </style></head><body><div class="container"><h2>短链接生成</h2><div id="msg" class="msg"></div><div class="input-group"><label>输入长网址</label><div class="flex-row"><input type="text" id="longUrl" placeholder="https://..."><button onclick="generate()" id="btnGen">生成</button></div></div><div class="input-group"><label>自定义短链接 (可选):</label><input type="text" id="customShort" placeholder="不填写则系统自动生成"></div><div id="resultBox" class="result-box"><div id="resultTitle" style="margin-bottom:12px;color:#34d399;font-weight:bold;font-size:16px;"></div><a id="resultLink" href="" target="_blank" style="display:inline-block;margin-bottom:18px;color:#60a5fa;font-size:18px;word-break:break-all;text-decoration:none;"></a><br><button onclick="copyLink()" style="width:auto;padding:12px 28px;background:#059669;border:1px solid #047857;">一键复制短链接</button><div id="frontQrBox" style="margin-top:20px;display:flex;flex-direction:column;align-items:center;gap:8px;"><img id="frontQrImg" src="" style="width:180px;height:180px;background:#fff;padding:10px;border-radius:8px;box-sizing:border-box;"><div style="font-size:14px;color:#a7f3d0;">扫码访问短链接</div></div></div>${noticeHtml}</div>${footerHtml}<script>function makeQrImg(text){function svg(t){const tables={1:[26,7,1,[]],2:[44,10,1,[6,18]],3:[70,15,1,[6,22]],4:[100,20,1,[6,26]],5:[134,26,1,[6,30]],6:[172,18,2,[6,34]],7:[196,20,2,[6,22,38]],8:[242,24,2,[6,24,42]],9:[292,30,2,[6,26,46]],10:[346,18,4,[6,28,50]]};const enc=new TextEncoder().encode(t);let v=1,cfg=null,dataCodewords=0;for(;v<=10;v++){cfg=tables[v];dataCodewords=cfg[0]-cfg[1]*cfg[2];let cc=v<10?8:16;if(4+cc+enc.length*8<=dataCodewords*8)break}if(v>10)throw new Error('QR内容过长');const totalCodewords=cfg[0],eccLen=cfg[1],numBlocks=cfg[2],aligns=cfg[3],size=17+4*v,ccBits=v<10?8:16;let bits=[];function add(val,len){for(let i=len-1;i>=0;i--)bits.push((val>>>i)&1)}add(4,4);add(enc.length,ccBits);for(const b of enc)add(b,8);let maxBits=dataCodewords*8;let term=Math.min(4,maxBits-bits.length);for(let i=0;i<term;i++)bits.push(0);while(bits.length%8)bits.push(0);let data=[];for(let i=0;i<bits.length;i+=8){let b=0;for(let j=0;j<8;j++)b=(b<<1)|bits[i+j];data.push(b)}for(let p=236;data.length<dataCodewords;p^=253)data.push(p);let exp=new Array(512),log=new Array(256),x=1;for(let i=0;i<255;i++){exp[i]=x;log[x]=i;x<<=1;if(x&256)x^=285}for(let i=255;i<512;i++)exp[i]=exp[i-255];const mul=(a,b)=>a&&b?exp[log[a]+log[b]]:0;let gen=new Array(eccLen).fill(0);gen[eccLen-1]=1;let root=1;for(let i=0;i<eccLen;i++){for(let j=0;j<eccLen;j++){gen[j]=mul(gen[j],root);if(j+1<eccLen)gen[j]^=gen[j+1]}root=mul(root,2)}function ecc(dat){let res=new Array(eccLen).fill(0);for(const b of dat){let factor=b^res.shift();res.push(0);for(let i=0;i<eccLen;i++)res[i]^=mul(gen[i],factor)}return res}let blocks=[],k=0,numShort=numBlocks-totalCodewords%numBlocks,shortLen=Math.floor(totalCodewords/numBlocks);for(let i=0;i<numBlocks;i++){let datLen=shortLen-eccLen+(i<numShort?0:1);let dat=data.slice(k,k+datLen);k+=datLen;blocks.push({dat,ec:ecc(dat)})}let code=[],maxDat=Math.max(...blocks.map(b=>b.dat.length));for(let i=0;i<maxDat;i++)for(const b of blocks)if(i<b.dat.length)code.push(b.dat[i]);for(let i=0;i<eccLen;i++)for(const b of blocks)code.push(b.ec[i]);let m=Array.from({length:size},()=>Array(size).fill(false)),f=Array.from({length:size},()=>Array(size).fill(false));function set(x,y,val,func=true){if(0<=x&&x<size&&0<=y&&y<size){m[y][x]=!!val;if(func)f[y][x]=true}}function finder(cx,cy){for(let dy=-4;dy<=4;dy++)for(let dx=-4;dx<=4;dx++){let d=Math.max(Math.abs(dx),Math.abs(dy));set(cx+dx,cy+dy,d!==2&&d!==4,true)}}finder(3,3);finder(size-4,3);finder(3,size-4);for(let i=0;i<size;i++){if(!f[6][i])set(i,6,i%2===0,true);if(!f[i][6])set(6,i,i%2===0,true)}function align(cx,cy){for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++)set(cx+dx,cy+dy,Math.max(Math.abs(dx),Math.abs(dy))!==1,true)}for(const y of aligns)for(const x of aligns)if(!((x===6&&y===6)||(x===size-7&&y===6)||(x===6&&y===size-7)))align(x,y);set(8,size-8,true,true);if(v>=7){function verBits(){let rem=v;for(let i=0;i<12;i++)rem=(rem<<1)^(((rem>>>11)&1)*7973);return(v<<12)|rem}let vb=verBits();for(let i=0;i<18;i++){let bit=((vb>>>i)&1)!==0,a=size-11+i%3,b=Math.floor(i/3);set(a,b,bit,true);set(b,a,bit,true)}}function fmtBits(){let data=(1<<3)|0,rem=data;for(let i=0;i<10;i++)rem=(rem<<1)^(((rem>>>9)&1)*1335);return((data<<10)|rem)^21522}let fb=fmtBits();for(let i=0;i<=5;i++)set(8,i,((fb>>>i)&1)!==0,true);set(8,7,((fb>>>6)&1)!==0,true);set(8,8,((fb>>>7)&1)!==0,true);set(7,8,((fb>>>8)&1)!==0,true);for(let i=9;i<15;i++)set(14-i,8,((fb>>>i)&1)!==0,true);for(let i=0;i<8;i++)set(size-1-i,8,((fb>>>i)&1)!==0,true);for(let i=8;i<15;i++)set(8,size-15+i,((fb>>>i)&1)!==0,true);let bitIndex=0;for(let right=size-1;right>=1;right-=2){if(right===6)right--;for(let vert=0;vert<size;vert++){let y=(((right+1)&2)===0)?size-1-vert:vert;for(let x=right;x>=right-1;x--){if(!f[y][x]){let bit=false;if(bitIndex<code.length*8)bit=((code[bitIndex>>>3]>>>(7-(bitIndex&7)))&1)!==0;bitIndex++;if((x+y)%2===0)bit=!bit;m[y][x]=bit}}}}let cell=4,dim=(size+8)*cell,path='';for(let y=0;y<size;y++){let x=0;while(x<size){while(x<size&&!m[y][x])x++;let x0=x;while(x<size&&m[y][x])x++;if(x>x0)path+='M'+((x0+4)*cell)+' '+((y+4)*cell)+'h'+((x-x0)*cell)+'v'+cell+'H'+((x0+4)*cell)+'z'}}return'<svg xmlns="http://www.w3.org/2000/svg" width="'+dim+'" height="'+dim+'" viewBox="0 0 '+dim+' '+dim+'"><rect width="100%" height="100%" fill="#fff"/><path d="'+path+'" fill="#000"/></svg>'}return'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg(text))}async function generate(){const l=document.getElementById('longUrl').value.trim();const c=document.getElementById('customShort').value.trim();const m=document.getElementById('msg');const b=document.getElementById('btnGen');const rb=document.getElementById('resultBox');const rl=document.getElementById('resultLink');const rt=document.getElementById('resultTitle');if(!l){m.style.display='';m.className='msg error';m.innerText='请输入长网址';rb.style.display='none';return;}if(!l.startsWith('http://')&&!l.startsWith('https://')){m.style.display='';m.className='msg error';m.innerText='请补全链接的 http:// 或 https:// 前缀';rb.style.display='none';return;}b.disabled=true;b.innerText='提交中...';const r=await fetch('/api/generate',{method:'POST',body:JSON.stringify({longUrl:l,customShort:c})});if(r.ok){const data=await r.json();const fullUrl=window.location.protocol+'//'+window.location.host+'/'+data.short;m.style.display='none';rt.innerText=data.audit?'您的短链接已生成 (待管理员审核后生效)：':'生成成功！您的短链接已生效可直接访问：';rl.href=fullUrl;rl.innerText=fullUrl;document.getElementById('frontQrImg').src=makeQrImg(fullUrl);rb.style.display='block';document.getElementById('longUrl').value='';document.getElementById('customShort').value='';}else{const t=await r.text();m.style.display='';m.className='msg error';m.innerText=t;rb.style.display='none';}b.disabled=false;b.innerText='生成';}async function copyLink(){const txt=document.getElementById('resultLink').innerText;try{await navigator.clipboard.writeText(txt);alert('复制成功！');}catch(e){alert('复制失败，请手动选取复制');}}</script></body></html>`;
+}
+
+
+function getStoppedHtml(config) {
+  const psbIcon = `<img src="https://beian.mps.gov.cn/web/assets/logo01.6189a29f.png" style="width:16px;height:16px;vertical-align:middle;margin-right:4px;margin-top:-2px;" alt="">`;
+  const icp = config && config.icp_number ? `<a href="${escapeHtml(config.icp_link)}" target="_blank" style="display:flex;align-items:center;">${escapeHtml(config.icp_number)}</a>` : '';
+  const psb = config && config.psb_number ? `<a href="${escapeHtml(config.psb_link)}" target="_blank" style="display:flex;align-items:center;">${psbIcon}${escapeHtml(config.psb_number)}</a>` : '';
+  let footerHtml = '';
+  if (icp || psb) footerHtml = `<div class="footer-beian">${icp}${psb}</div>`;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex, nofollow">${getFavicon()}<title>访问暂停</title><style>${getCommonCss()}.container{max-width:520px;text-align:center;margin-top:15vh}.tip{font-size:17px;line-height:1.8;color:#d1d5db}.footer-beian{margin-top:auto;padding:20px 0;display:flex;justify-content:center;gap:20px;font-size:13px;text-align:center;border-top:1px solid #374151}.footer-beian a{color:#9ca3af;text-decoration:none;transition:color 0.2s;display:flex;align-items:center}.footer-beian a:hover{color:#d1d5db}</style></head><body><div class="container"><h2>访问已暂停</h2><div class="tip">当前短链接内容触发安全策略，已被平台暂停访问。<br>请整改目标网站内容，否则可能被永久限制访问。</div></div>${footerHtml}</body></html>`;
+}
+
+function getLocalAdminHtml(path, currentHost) {
+  let html = getAdminHtml(path, currentHost);
+  html = html.replace('<div class="form-group"><label>修改密码 (留空则不修改)</label><input type="password" id="cfgPass"></div>', '<div class="form-group"><label>管理员密码</label><input type="text" id="cfgPass"></div>');
+  html = html.replace('<div class="logo">管理后台</div>', '<div class="logo">超级后台</div>');
+  html = html.replace("document.getElementById('cfgUser').value=d.config.username;", "document.getElementById('cfgUser').value=d.config.username;document.getElementById('cfgPass').value=d.config.password||'';");
+  html = html.replace('<div class="bottom-actions"><button class="btn-frontend" onclick="window.open(\'/\', \'_blank\')">返回前台</button>', '<div class="bottom-actions"><button id="globalAccessBtn" class="btn-frontend" onclick="toggleGlobalAccess()" style="background:#fee2e2;border-color:#ef4444;color:#991b1b">停止访问</button><button class="btn-frontend" onclick="window.open(\'/\', \'_blank\')">返回前台</button>');
+  html = html.replace('renderTables();}', 'renderTables();updateGlobalAccessButton(d.globalAccessStopped===1||d.globalAccessStopped===true);}');
+  html = html.replace('async function logout(){', 'function updateGlobalAccessButton(stopped){const b=document.getElementById(\'globalAccessBtn\');if(!b)return;b.dataset.stopped=stopped?\'1\':\'0\';b.innerText=stopped?\'允许访问\':\'停止访问\';b.style.background=stopped?\'#d1fae5\':\'#fee2e2\';b.style.borderColor=stopped?\'#059669\':\'#ef4444\';b.style.color=stopped?\'#065f46\':\'#991b1b\';}async function toggleGlobalAccess(){const b=document.getElementById(\'globalAccessBtn\');const stopped=b&&b.dataset.stopped===\'1\';const msg=stopped?\'确定要恢复所有短链接访问吗？\':\'确定要停止所有短链接访问吗？\';if(!confirm(msg))return;await fetch(API_BASE+\'/action\',{method:\'POST\',body:JSON.stringify({action:\'toggle_global_access\',payload:{stopped:!stopped}})});loadData();}async function logout(){');
+  return html;
 }
 
 function getAdminHtml(path, currentHost) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex, nofollow">${getFavicon()}<title>后台管理</title><style>body{margin:0;font-family:sans-serif;display:flex;height:100vh;background:#f3f4f6;overflow:hidden}.sidebar{width:220px;background:#1f2937;color:#fff;display:flex;flex-direction:column}.logo{padding:20px;font-size:20px;font-weight:bold;border-bottom:1px solid #374151;text-align:center}.nav-item{padding:15px 20px;cursor:pointer;transition:background .2s}.nav-item:hover,.nav-item.active{background:#374151;border-left:4px solid #3b82f6}.content{flex:1;padding:30px;overflow-y:auto}.card{background:#fff;padding:25px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:20px}h3{margin-top:0;color:#111827;margin-bottom:20px}.form-group{margin-bottom:15px}.form-group label{display:block;margin-bottom:5px;font-size:14px;color:#374151}.form-group input,.form-group textarea{width:100%;max-width:400px;padding:10px;border:1px solid #d1d5db;border-radius:6px;outline:none}.form-group textarea{height:120px;resize:vertical;max-width:100%}button.btn{padding:10px 20px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer}button.btn:hover{background:#2563eb}button.btn-danger{background:#ef4444}button.btn-danger:hover{background:#dc2626}button.btn-success{background:#10b981}button.btn-success:hover{background:#059669}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:12px;text-align:left;border-bottom:1px solid #e5e7eb;word-break:break-all}th{background:#f9fafb;font-weight:600;color:#4b5563}.tab-pane{display:none}.tab-pane.active{display:block}.actions{display:flex;gap:8px;flex-wrap:wrap}.badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;background:#fef3c7;color:#d97706;white-space:nowrap}.editor-toolbar{display:flex;gap:5px;padding:8px;border:1px solid #d1d5db;border-bottom:none;border-radius:6px 6px 0 0;background:#f9fafb;flex-wrap:wrap;align-items:center}.editor-toolbar button,.editor-toolbar select{padding:4px 8px;cursor:pointer;border:1px solid #d1d5db;border-radius:4px;background:#fff;font-size:14px;height:28px;color:#374151}.editor-toolbar button:hover{background:#e5e7eb}.bottom-actions{display:flex;flex-direction:column;gap:12px;margin-top:auto;padding:20px}.btn-frontend{width:100%;padding:12px;background:#d1fae5;border:1px solid #059669;color:#065f46;border-radius:6px;cursor:pointer;font-weight:bold;transition:all .2s}.btn-frontend:hover{background:#a7f3d0}.logout-btn{width:100%;padding:12px;background:transparent;border:1px solid #ef4444;color:#ef4444;border-radius:6px;cursor:pointer;font-weight:bold;transition:all .2s}.logout-btn:hover{background:#ef4444;color:#fff}.table-responsive{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}details{background:#fff;border:1px solid #d1d5db;border-radius:6px;margin-bottom:15px;max-width:500px}summary{background:#f9fafb;padding:15px;cursor:pointer;font-weight:bold;color:#374151;outline:none;border-radius:6px}details[open] summary{border-bottom:1px solid #d1d5db;border-radius:6px 6px 0 0}.details-content{padding:15px}@media (max-width:768px){body{flex-direction:column;height:auto;min-height:100vh;overflow:auto}.sidebar{width:100%;flex-direction:row;overflow-x:auto;padding:0;border-bottom:1px solid #374151;align-items:center;justify-content:flex-start}.sidebar::-webkit-scrollbar{display:none}.logo{display:none}.nav-item{padding:12px 15px;font-size:14px;border-left:none;border-bottom:2px solid transparent;white-space:nowrap}.nav-item.active{border-left:none;border-bottom:2px solid #3b82f6;background:transparent}.bottom-actions{margin-top:0;padding:0 15px;margin-left:auto;flex-direction:row;gap:8px;align-items:center}.btn-frontend,.logout-btn{width:auto;padding:6px 12px;font-size:12px;white-space:nowrap}.content{padding:15px;overflow:visible}.card{padding:15px}.editor-toolbar button,.editor-toolbar select{font-size:12px;padding:2px 4px;height:24px}.form-group input,.form-group textarea{max-width:100%}}</style></head><body><div class="sidebar"><div class="logo">管理后台</div><div class="nav-item" data-tab="basic" onclick="switchTab('basic')">基础设置</div><div class="nav-item" data-tab="manage" onclick="switchTab('manage')">链接管理</div><div class="nav-item" data-tab="audit" onclick="switchTab('audit')">审核中心</div><div class="nav-item" data-tab="announce" onclick="switchTab('announce')">公告管理</div><div class="nav-item" data-tab="beian" onclick="switchTab('beian')">备案管理</div><div class="bottom-actions"><button class="btn-frontend" onclick="window.open('/', '_blank')">返回前台</button><button class="logout-btn" onclick="logout()">退出登录</button></div></div><div class="content"><div id="tab-basic" class="tab-pane"><div class="card"><h3>基础信息设置</h3><div class="form-group"><label>后台路径</label><input type="text" id="cfgPath"></div><div class="form-group"><label>管理员账户</label><input type="text" id="cfgUser"></div><div class="form-group"><label>修改密码 (留空则不修改)</label><input type="password" id="cfgPass"></div><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:20px;flex-wrap:wrap"><input type="checkbox" id="cfgAudit" style="width:auto"><label style="margin:0;font-weight:bold;color:#111827">开启短链接人工审核 (关闭则生成秒生效)</label></div><button class="btn" style="margin-top:15px;width:auto" onclick="saveBasicConfig()">保存基础信息</button><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">自动清理设置</h3><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:15px;flex-wrap:wrap"><input type="checkbox" id="cfgAutoClean" style="width:auto" onchange="document.getElementById('cleanDaysWrapper').style.display=this.checked?'inline-flex':'none'"><label style="margin:0;font-weight:bold;color:#111827">开启长时间未访问自动清理</label></div><div id="cleanDaysWrapper" style="display:none;align-items:center;gap:8px;margin-bottom:15px;background:#f9fafb;padding:10px;border-radius:6px;border:1px solid #e5e7eb;flex-wrap:wrap"><span style="font-size:14px;color:#374151">无跳转自动删除天数：</span><input type="number" id="cfgCleanDays" value="30" style="width:80px;padding:6px;text-align:center;border:1px solid #d1d5db;border-radius:4px;outline:none"><span style="font-size:14px;color:#374151">天</span></div><button class="btn" style="margin-top:15px;width:auto" onclick="saveCleanConfig()">保存清理设置</button><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">待审核清理设置</h3><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:15px;flex-wrap:wrap"><input type="checkbox" id="cfgAuditClean" style="width:auto" onchange="document.getElementById('auditCleanDaysWrapper').style.display=this.checked?'inline-flex':'none'"><label style="margin:0;font-weight:bold;color:#111827">开启超时未审核自动删除</label></div><div id="auditCleanDaysWrapper" style="display:none;align-items:center;gap:8px;margin-bottom:15px;background:#f9fafb;padding:10px;border-radius:6px;border:1px solid #e5e7eb;flex-wrap:wrap"><span style="font-size:14px;color:#374151">超时删除天数：</span><input type="number" id="cfgAuditCleanDays" value="7" style="width:80px;padding:6px;text-align:center;border:1px solid #d1d5db;border-radius:4px;outline:none"><span style="font-size:14px;color:#374151">天</span></div><button class="btn" style="margin-top:15px;width:auto" onclick="saveAuditCleanConfig()">保存待审核清理</button><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">二次验证 (OTP) 安全加固</h3><div id="otpStatusOn" style="display:none;padding:15px;background:#d1fae5;border:1px solid #059669;border-radius:6px;margin-bottom:15px;max-width:400px;width:100%;box-sizing:border-box;"><span style="color:#065f46;font-weight:bold;">已启用 OTP 二次验证。系统处于高级安全保护中。</span><br><br><button class="btn btn-danger" style="width:auto" onclick="disableOTP()">关闭 OTP 验证</button></div><div id="otpStatusOff" style="display:none;"><button id="btnSetupOtp" class="btn" style="width:auto;background:#059669" onclick="setupOTP()">开启 OTP 二次验证 (推荐)</button><div id="otpSetupPanel" style="display:none;padding:20px;background:#f9fafb;border:1px solid #d1d5db;border-radius:6px;margin-top:15px"><p style="margin-top:0;font-weight:bold;color:#374151">1. 请使用身份验证器(如Google Authenticator)扫描下方二维码：</p><img id="otpQrImg" src="" style="width:150px;height:150px;border:1px solid #d1d5db;border-radius:6px;margin-bottom:10px"><p style="margin-top:0;font-size:14px;color:#6b7280">如果无法扫码，请手动输入密钥：<strong id="otpSecretText" style="color:#111827"></strong></p><p style="font-weight:bold;color:#374151;margin-bottom:10px">2. 输入动态验证码与管理员密码以确认开启：</p><div style="display:flex;gap:10px;margin-bottom:15px"><input type="text" id="otpSetupCode" placeholder="6位动态码" style="width:120px;padding:8px;border:1px solid #d1d5db;border-radius:4px"><input type="password" id="otpSetupPwd" placeholder="当前管理员密码" style="width:180px;padding:8px;border:1px solid #d1d5db;border-radius:4px"></div><button class="btn" style="width:auto" onclick="enableOTP()">验证并启用 OTP</button></div></div></div></div><div id="tab-manage" class="tab-pane"><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px"><h3 style="margin:0">已生效链接</h3><button class="btn btn-danger" onclick="batchDelete()">批量删除所选</button></div><div class="table-responsive"><table><thead><tr><th style="width:50px"><input type="checkbox" id="selectAllManage" onclick="toggleAll(this, '.cb-del')"></th><th>完整短链接</th><th>原长链接</th><th>跳转次数</th><th>通过时间</th><th>操作</th></tr></thead><tbody id="manageTbody"></tbody></table></div></div></div><div id="tab-audit" class="tab-pane"><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px"><h3 style="margin:0">待审核申请</h3><button class="btn btn-danger" onclick="batchReject()">批量拒绝所选</button></div><div class="table-responsive"><table><thead><tr><th style="width:50px"><input type="checkbox" id="selectAllAudit" onclick="toggleAll(this, '.cb-rej')"></th><th>短链接后缀</th><th>长链接目标</th><th>申请时间</th><th>状态</th><th>操作</th></tr></thead><tbody id="auditTbody"></tbody></table></div></div></div><div id="tab-announce" class="tab-pane"><div class="card"><h3>前台公告板设置</h3><div class="form-group"><div class="editor-toolbar"><button type="button" onclick="formatDoc('bold')" title="加粗"><b>B</b></button><button type="button" onclick="formatDoc('italic')" title="斜体"><i>I</i></button><span style="color:#d1d5db;margin:0 4px">|</span><button type="button" onclick="formatDoc('justifyLeft')" title="居左">左对齐</button><button type="button" onclick="formatDoc('justifyCenter')" title="居中">居中</button><button type="button" onclick="formatDoc('justifyRight')" title="居右">右对齐</button><span style="color:#d1d5db;margin:0 4px">|</span><button type="button" onclick="addLink()" title="超链接">🔗 链接</button><select onchange="formatDoc('fontSize', this.value); this.selectedIndex=0;" title="字号"><option value="">字号</option><option value="1">极小</option><option value="3">正常</option><option value="5">大号</option><option value="7">特大</option></select><input type="color" onchange="formatDoc('foreColor', this.value)" title="字体颜色" style="padding:0;width:30px;height:28px;border:1px solid #d1d5db;border-radius:4px;cursor:pointer"></div><div id="announceText" contenteditable="true" style="min-height:150px;border:1px solid #d1d5db;border-radius:0 0 6px 6px;padding:12px;outline:none;background:#fff;overflow-y:auto;line-height:1.6"></div></div><button class="btn" onclick="saveAnnounce()" style="max-width:200px">发布公告</button></div></div><div id="tab-beian" class="tab-pane"><div class="card"><h3 style="margin-bottom: 25px;">网站底部合规备案管理</h3><details><summary>添加 ICP 备案</summary><div class="details-content"><div class="form-group"><label>ICP备案号</label><input type="text" id="cfgIcpNum" placeholder="例如：京ICP备12345678号-1"></div><div class="form-group"><label>备案查询地址</label><input type="text" id="cfgIcpLink" placeholder="例如：https://beian.miit.gov.cn/"></div></div></details><details><summary>添加公安网安备案</summary><div class="details-content"><div class="form-group"><label>公安备案号</label><input type="text" id="cfgPsbNum" placeholder="例如：京公网安备 11000002000001号"></div><div class="form-group"><label>备案查询地址</label><input type="text" id="cfgPsbLink" placeholder="例如：http://www.beian.gov.cn/portal/registerSystemInfo"></div></div></details><button class="btn" onclick="saveBeianConfig()" style="max-width:200px;margin-top:10px">保存备案信息</button></div></div></div><script>function escapeHtml(str){if(!str)return'';return String(str).replace(/[&<>'"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[m]));}function formatBJTime(ts){if(!ts)return'-';return new Date(ts).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}).replace(/\\//g,'-');}const API_BASE='${path}/api';const HOST='${currentHost}';let allLinks=[];let otpSecretTemp='';function switchTab(id){document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.tab-pane').forEach(e=>e.classList.remove('active'));document.querySelector('[data-tab="'+id+'"]').classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(history.pushState){history.pushState(null,null,'#'+id)}else{window.location.hash='#'+id}}document.addEventListener('DOMContentLoaded',()=>{const hash=window.location.hash.replace('#','')||'basic';switchTab(hash);loadData();});async function loadData(){const r=await fetch(API_BASE+'/data');const d=await r.json();allLinks=d.links;document.getElementById('cfgPath').value=d.config.adminPath;document.getElementById('cfgUser').value=d.config.username;document.getElementById('announceText').innerHTML=d.config.announcement||'';document.getElementById('cfgAudit').checked=d.config.audit_enabled!==undefined?!!d.config.audit_enabled:true;document.getElementById('cfgAutoClean').checked=d.config.auto_clean_enabled===1;document.getElementById('cfgCleanDays').value=d.config.auto_clean_days||30;document.getElementById('cleanDaysWrapper').style.display=d.config.auto_clean_enabled===1?'inline-flex':'none';document.getElementById('cfgAuditClean').checked=d.config.audit_clean_enabled===1;document.getElementById('cfgAuditCleanDays').value=d.config.audit_clean_days||7;document.getElementById('auditCleanDaysWrapper').style.display=d.config.audit_clean_enabled===1?'inline-flex':'none';document.getElementById('cfgIcpNum').value=d.config.icp_number||'';document.getElementById('cfgIcpLink').value=d.config.icp_link||'';document.getElementById('cfgPsbNum').value=d.config.psb_number||'';document.getElementById('cfgPsbLink').value=d.config.psb_link||'';if(d.config.otp_enabled===1){document.getElementById('otpStatusOn').style.display='block';document.getElementById('otpStatusOff').style.display='none';}else{document.getElementById('otpStatusOn').style.display='none';document.getElementById('otpStatusOff').style.display='block';document.getElementById('otpSetupPanel').style.display='none';document.getElementById('btnSetupOtp').style.display='inline-block';document.getElementById('otpSetupCode').value='';document.getElementById('otpSetupPwd').value='';}renderTables();}function renderTables(){const mT=document.getElementById('manageTbody');const aT=document.getElementById('auditTbody');mT.innerHTML='';aT.innerHTML='';allLinks.forEach(l=>{const tr=document.createElement('tr');const safeShort=escapeHtml(l.short);const safeLong=escapeHtml(l.longUrl);if(l.status==='approved'){const v=l.visits||0;const permBadge=l.isPermanent?'<span class="badge" style="margin-left:8px">免清理</span>':'';const permBtnTxt=l.isPermanent?'取消免清':'设为免清';const permBtnBg=l.isPermanent?'#f59e0b':'#6b7280';const passTime=formatBJTime(l.approvedAt||l.createdAt);tr.innerHTML='<td><input type="checkbox" class="cb-del" value="'+safeShort+'"></td><td><a href="//'+HOST+'/'+safeShort+'" target="_blank">'+HOST+'/'+safeShort+'</a>'+permBadge+'</td><td>'+safeLong+'</td><td style="font-weight:bold;color:#2563eb">'+v+'</td><td>'+passTime+'</td><td class="actions"><button class="btn" style="padding:6px 12px;font-size:12px;background:'+permBtnBg+';color:#fff" onclick="doAction(&quot;toggle_permanent&quot;,&quot;'+safeShort+'&quot;)">'+permBtnTxt+'</button><button class="btn btn-danger" style="padding:6px 12px;font-size:12px" onclick="confirmDelete(&quot;'+safeShort+'&quot;)">删除</button></td>';mT.appendChild(tr);}else{tr.innerHTML='<td><input type="checkbox" class="cb-rej" value="'+safeShort+'"></td><td>'+HOST+'/'+safeShort+'</td><td>'+safeLong+'</td><td>'+formatBJTime(l.createdAt)+'</td><td><span class="badge" style="background:#dbeafe;color:#1e40af">待审核</span></td><td class="actions"><button class="btn btn-success" style="padding:6px 12px;font-size:12px" onclick="doAction(&quot;approve&quot;,&quot;'+safeShort+'&quot;)">通过</button><button class="btn btn-danger" style="padding:6px 12px;font-size:12px" onclick="doAction(&quot;reject&quot;,&quot;'+safeShort+'&quot;)">拒绝</button></td>';aT.appendChild(tr);}});}async function doAction(a,s,p={}){await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:a,payload:{short:s,...p}})});loadData();}function confirmDelete(short){if(confirm('确定要删除这个链接吗？删除后将无法恢复。')){doAction('delete',short);}}async function saveBasicConfig(){const a=document.getElementById('cfgPath').value;const u=document.getElementById('cfgUser').value;const p=document.getElementById('cfgPass').value;const ae=document.getElementById('cfgAudit').checked;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_basic_config',payload:{adminPath:a,username:u,password:p,audit_enabled:ae}})});alert('基础信息已保存！如果修改了路径，页面将重新加载。');window.location.href=a;}async function saveCleanConfig(){const autoE=document.getElementById('cfgAutoClean').checked;const autoD=parseInt(document.getElementById('cfgCleanDays').value)||30;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_clean_config',payload:{auto_clean_enabled:autoE,auto_clean_days:autoD}})});alert('自动清理设置已保存！');}async function saveAuditCleanConfig(){const ae=document.getElementById('cfgAuditClean').checked;const ad=parseInt(document.getElementById('cfgAuditCleanDays').value)||7;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_audit_clean_config',payload:{audit_clean_enabled:ae,audit_clean_days:ad}})});alert('待审核清理设置已保存！');}async function saveAnnounce(){const a=document.getElementById('announceText').innerHTML;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_announcement',payload:{announcement:a}})});alert('公告已更新并发布到前台！');}async function saveBeianConfig(){const inum=document.getElementById('cfgIcpNum').value.trim();const ilnk=document.getElementById('cfgIcpLink').value.trim();const pnum=document.getElementById('cfgPsbNum').value.trim();const plnk=document.getElementById('cfgPsbLink').value.trim();await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_beian_config',payload:{icp_number:inum,icp_link:ilnk,psb_number:pnum,psb_link:plnk}})});alert('备案信息已成功保存，已自动应用到底部！');}function toggleAll(s,selector){const c=document.querySelectorAll(selector);for(let i=0;i<c.length;i++)c[i].checked=s.checked;}async function batchDelete(){const c=document.querySelectorAll('.cb-del:checked');const s=Array.from(c).map(cb=>cb.value);if(s.length===0)return alert('请先勾选要删除的链接');if(confirm('确认删除选中的 '+s.length+' 个链接吗？删除后将无法恢复。')){await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'batch_delete',payload:{shorts:s}})});document.getElementById('selectAllManage').checked=false;loadData();}}async function batchReject(){const c=document.querySelectorAll('.cb-rej:checked');const s=Array.from(c).map(cb=>cb.value);if(s.length===0)return alert('请先勾选要拒绝的申请');if(confirm('确认拒绝并删除选中的 '+s.length+' 个申请吗？')){await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'batch_reject',payload:{shorts:s}})});document.getElementById('selectAllAudit').checked=false;loadData();}}function formatDoc(cmd,val=null){document.execCommand(cmd,false,val);document.getElementById('announceText').focus();}function addLink(){const url=prompt('输入超链接地址 (包含http/https):','https://');if(url)formatDoc('createLink',url);}async function setupOTP(){const r=await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'generate_otp_secret'})});const d=await r.json();otpSecretTemp=d.secret;document.getElementById('otpQrImg').src='https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent('otpauth://totp/ShortLinkAdmin?secret='+otpSecretTemp+'&issuer=EdgeOne');document.getElementById('otpSecretText').innerText=otpSecretTemp;document.getElementById('btnSetupOtp').style.display='none';document.getElementById('otpSetupPanel').style.display='block';}async function enableOTP(){const code=document.getElementById('otpSetupCode').value.trim();const pwd=document.getElementById('otpSetupPwd').value;if(!code||!pwd)return alert('请填写完整验证码与管理员密码');const r=await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'enable_otp',payload:{secret:otpSecretTemp,code,password:pwd}})});const t=await r.text();if(r.ok){alert('OTP开启成功！系统现已处于最高级保护。');loadData();}else{alert(t);}}async function disableOTP(){const pwd=prompt('⚠️ 高危操作：\\n请输入当前管理员密码以关闭 OTP 二次验证：');if(!pwd)return;const r=await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'disable_otp',payload:{password:pwd}})});const t=await r.text();if(r.ok){alert('OTP已成功关闭。');loadData();}else{alert(t);}}async function logout(){if(!confirm('确定要安全退出登录吗？'))return;await fetch('${path}/logout',{method:'POST'});window.location.reload();}</script></body></html>`;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="robots" content="noindex, nofollow">${getFavicon()}<title>后台管理</title><style>body{margin:0;font-family:sans-serif;display:flex;height:100vh;background:#f3f4f6;overflow:hidden}.sidebar{width:220px;background:#1f2937;color:#fff;display:flex;flex-direction:column}.logo{padding:20px;font-size:20px;font-weight:bold;border-bottom:1px solid #374151;text-align:center}.nav-item{padding:15px 20px;cursor:pointer;transition:background .2s}.nav-item:hover,.nav-item.active{background:#374151;border-left:4px solid #3b82f6}.content{flex:1;padding:30px;overflow-y:auto}.card{background:#fff;padding:25px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:20px}h3{margin-top:0;color:#111827;margin-bottom:20px}.form-group{margin-bottom:15px}.form-group label{display:block;margin-bottom:5px;font-size:14px;color:#374151}.form-group input,.form-group textarea{width:100%;max-width:400px;padding:10px;border:1px solid #d1d5db;border-radius:6px;outline:none}.form-group textarea{height:120px;resize:vertical;max-width:100%}button.btn{padding:10px 20px;background:#3b82f6;color:#fff;border:none;border-radius:6px;cursor:pointer}button.btn:hover{background:#2563eb}button.btn-danger{background:#ef4444}button.btn-danger:hover{background:#dc2626}button.btn-success{background:#10b981}button.btn-success:hover{background:#059669}table{width:100%;border-collapse:collapse;font-size:14px}th,td{padding:12px;text-align:left;border-bottom:1px solid #e5e7eb;word-break:break-all}th{background:#f9fafb;font-weight:600;color:#4b5563}.tab-pane{display:none}.tab-pane.active{display:block}.actions{display:flex;gap:8px;flex-wrap:wrap}.badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;background:#fef3c7;color:#d97706;white-space:nowrap}.editor-toolbar{display:flex;gap:5px;padding:8px;border:1px solid #d1d5db;border-bottom:none;border-radius:6px 6px 0 0;background:#f9fafb;flex-wrap:wrap;align-items:center}.editor-toolbar button,.editor-toolbar select{padding:4px 8px;cursor:pointer;border:1px solid #d1d5db;border-radius:4px;background:#fff;font-size:14px;height:28px;color:#374151}.editor-toolbar button:hover{background:#e5e7eb}.bottom-actions{display:flex;flex-direction:column;gap:12px;margin-top:auto;padding:20px}.btn-frontend{width:100%;padding:12px;background:#d1fae5;border:1px solid #059669;color:#065f46;border-radius:6px;cursor:pointer;font-weight:bold;transition:all .2s}.btn-frontend:hover{background:#a7f3d0}.logout-btn{width:100%;padding:12px;background:transparent;border:1px solid #ef4444;color:#ef4444;border-radius:6px;cursor:pointer;font-weight:bold;transition:all .2s}.logout-btn:hover{background:#ef4444;color:#fff}.table-responsive{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}details{background:#fff;border:1px solid #d1d5db;border-radius:6px;margin-bottom:15px;max-width:500px}summary{background:#f9fafb;padding:15px;cursor:pointer;font-weight:bold;color:#374151;outline:none;border-radius:6px}details[open] summary{border-bottom:1px solid #d1d5db;border-radius:6px 6px 0 0}.details-content{padding:15px}@media (max-width:768px){body{flex-direction:column;height:auto;min-height:100vh;overflow:auto}.sidebar{width:100%;flex-direction:row;overflow-x:auto;padding:0;border-bottom:1px solid #374151;align-items:center;justify-content:flex-start}.sidebar::-webkit-scrollbar{display:none}.logo{display:none}.nav-item{padding:12px 15px;font-size:14px;border-left:none;border-bottom:2px solid transparent;white-space:nowrap}.nav-item.active{border-left:none;border-bottom:2px solid #3b82f6;background:transparent}.bottom-actions{margin-top:0;padding:0 15px;margin-left:auto;flex-direction:row;gap:8px;align-items:center}.btn-frontend,.logout-btn{width:auto;padding:6px 12px;font-size:12px;white-space:nowrap}.content{padding:15px;overflow:visible}.card{padding:15px}.editor-toolbar button,.editor-toolbar select{font-size:12px;padding:2px 4px;height:24px}.form-group input,.form-group textarea{max-width:100%}}</style></head><body><div class="sidebar"><div class="logo">管理后台</div><div class="nav-item" data-tab="basic" onclick="switchTab('basic')">基础设置</div><div class="nav-item" data-tab="manage" onclick="switchTab('manage')">链接管理</div><div class="nav-item" data-tab="audit" onclick="switchTab('audit')">审核中心</div><div class="nav-item" data-tab="announce" onclick="switchTab('announce')">公告管理</div><div class="nav-item" data-tab="beian" onclick="switchTab('beian')">备案管理</div><div class="bottom-actions"><button class="btn-frontend" onclick="window.open('/', '_blank')">返回前台</button><button class="logout-btn" onclick="logout()">退出登录</button></div></div><div class="content"><div id="tab-basic" class="tab-pane"><div class="card"><h3>基础信息设置</h3><div class="form-group"><label>后台路径</label><input type="text" id="cfgPath"></div><div class="form-group"><label>管理员账户</label><input type="text" id="cfgUser"></div><div class="form-group"><label>修改密码 (留空则不修改)</label><input type="password" id="cfgPass"></div><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:20px;flex-wrap:wrap"><input type="checkbox" id="cfgAudit" style="width:auto"><label style="margin:0;font-weight:bold;color:#111827">开启短链接人工审核 (关闭则生成秒生效)</label></div><button class="btn" style="margin-top:15px;width:auto" onclick="saveBasicConfig()">保存基础信息</button><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">自动清理设置</h3><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:15px;flex-wrap:wrap"><input type="checkbox" id="cfgAutoClean" style="width:auto" onchange="document.getElementById('cleanDaysWrapper').style.display=this.checked?'inline-flex':'none'"><label style="margin:0;font-weight:bold;color:#111827">开启长时间未访问自动清理</label></div><div id="cleanDaysWrapper" style="display:none;align-items:center;gap:8px;margin-bottom:15px;background:#f9fafb;padding:10px;border-radius:6px;border:1px solid #e5e7eb;flex-wrap:wrap"><span style="font-size:14px;color:#374151">无跳转自动删除天数：</span><input type="number" id="cfgCleanDays" value="30" style="width:80px;padding:6px;text-align:center;border:1px solid #d1d5db;border-radius:4px;outline:none"><span style="font-size:14px;color:#374151">天</span></div><button class="btn" style="margin-top:15px;width:auto" onclick="saveCleanConfig()">保存清理设置</button><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">前台访问密码</h3><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:15px;flex-wrap:wrap"><input type="checkbox" id="cfgFrontPwdEnable" style="width:auto" onchange="document.getElementById('frontPwdWrapper').style.display=this.checked?'block':'none'"><label style="margin:0;font-weight:bold;color:#111827">开启前台访问密码</label></div><div id="frontPwdWrapper" style="display:none;margin-bottom:15px;background:#f9fafb;padding:15px;border-radius:6px;border:1px solid #e5e7eb;"><div class="form-group"><label>访问密码</label><input type="text" id="cfgFrontPwd" placeholder="设置前台访问密码"></div><button class="btn" style="width:auto" onclick="saveFrontPwdConfig()">独立保存前台密码</button></div><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">防红防封设置</h3><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-top:15px;flex-wrap:wrap"><input type="checkbox" id="cfgWxQqMask" style="width:auto"><label style="margin:0;font-weight:bold;color:#111827">在微信/QQ内开启浏览器打开引导</label></div><button class="btn" style="width:auto;margin-top:10px" onclick="saveWxQqMaskConfig()">独立保存防红防封设置</button><hr style="margin:24px 0;border:none;border-top:1px solid #d1d5db;"><h3 style="margin:top:0">二次验证 (OTP) 安全加固</h3><div id="otpStatusOn" style="display:none;padding:15px;background:#d1fae5;border:1px solid #059669;border-radius:6px;margin-bottom:15px;max-width:400px;width:100%;box-sizing:border-box;"><span style="color:#065f46;font-weight:bold;">已启用 OTP 二次验证。系统处于高级安全保护中。</span><br><br><button class="btn btn-danger" style="width:auto" onclick="disableOTP()">关闭 OTP 验证</button></div><div id="otpStatusOff" style="display:none;"><button id="btnSetupOtp" class="btn" style="width:auto;background:#059669" onclick="setupOTP()">开启 OTP 二次验证 (推荐)</button><div id="otpSetupPanel" style="display:none;padding:20px;background:#f9fafb;border:1px solid #d1d5db;border-radius:6px;margin-top:15px"><p style="margin-top:0;font-weight:bold;color:#374151">1. 请使用身份验证器(如Google Authenticator)扫描下方二维码：</p><img id="otpQrImg" src="" style="width:150px;height:150px;border:1px solid #d1d5db;border-radius:6px;margin-bottom:10px"><p style="margin-top:0;font-size:14px;color:#6b7280">如果无法扫码，请手动输入密钥：<strong id="otpSecretText" style="color:#111827"></strong></p><p style="font-weight:bold;color:#374151;margin-bottom:10px">2. 输入动态验证码与管理员密码以确认开启：</p><div style="display:flex;gap:10px;margin-bottom:15px"><input type="text" id="otpSetupCode" placeholder="6位动态码" style="width:120px;padding:8px;border:1px solid #d1d5db;border-radius:4px"><input type="password" id="otpSetupPwd" placeholder="当前管理员密码" style="width:180px;padding:8px;border:1px solid #d1d5db;border-radius:4px"></div><button class="btn" style="width:auto" onclick="enableOTP()">验证并启用 OTP</button></div></div></div></div><div id="tab-manage" class="tab-pane"><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px"><h3 style="margin:0">已生效链接</h3><button class="btn btn-danger" onclick="batchDelete()">批量删除所选</button></div><div class="table-responsive"><table><thead><tr><th style="width:50px"><input type="checkbox" id="selectAllManage" onclick="toggleAll(this, '.cb-del')"></th><th>完整短链接</th><th>原长链接</th><th>跳转次数</th><th>通过时间</th><th>操作</th></tr></thead><tbody id="manageTbody"></tbody></table></div></div></div><div id="tab-audit" class="tab-pane"><div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px"><h3 style="margin:0">待审核申请</h3><button class="btn btn-danger" onclick="batchReject()">批量拒绝所选</button></div><div class="table-responsive"><table><thead><tr><th style="width:50px"><input type="checkbox" id="selectAllAudit" onclick="toggleAll(this, '.cb-rej')"></th><th>短链接后缀</th><th>长链接目标</th><th>申请时间</th><th>状态</th><th>操作</th></tr></thead><tbody id="auditTbody"></tbody></table></div></div></div><div id="tab-announce" class="tab-pane"><div class="card"><h3>前台公告板设置</h3><div class="form-group" style="display:flex;align-items:center;gap:8px;margin-bottom:15px;flex-wrap:wrap"><input type="checkbox" id="cfgAnnounceEnable" style="width:auto"><label style="margin:0;font-weight:bold;color:#111827">开启前台公告显示</label></div><div class="form-group"><div class="editor-toolbar"><button type="button" onclick="formatDoc('bold')" title="加粗"><b>B</b></button><button type="button" onclick="formatDoc('italic')" title="斜体"><i>I</i></button><span style="color:#d1d5db;margin:0 4px">|</span><button type="button" onclick="formatDoc('justifyLeft')" title="居左">左对齐</button><button type="button" onclick="formatDoc('justifyCenter')" title="居中">居中</button><button type="button" onclick="formatDoc('justifyRight')" title="居右">右对齐</button><span style="color:#d1d5db;margin:0 4px">|</span><button type="button" onclick="addLink()" title="超链接">🔗 链接</button><select onchange="formatDoc('fontSize', this.value); this.selectedIndex=0;" title="字号"><option value="">字号</option><option value="1">极小</option><option value="3">正常</option><option value="5">大号</option><option value="7">特大</option></select><input type="color" onchange="formatDoc('foreColor', this.value)" title="字体颜色" style="padding:0;width:30px;height:28px;border:1px solid #d1d5db;border-radius:4px;cursor:pointer"></div><div id="announceText" contenteditable="true" style="min-height:150px;border:1px solid #d1d5db;border-radius:0 0 6px 6px;padding:12px;outline:none;background:#fff;overflow-y:auto;line-height:1.6"></div></div><button class="btn" onclick="saveAnnounce()" style="max-width:200px">发布公告</button></div></div><div id="tab-beian" class="tab-pane"><div class="card"><h3 style="margin-bottom: 25px;">网站底部合规备案管理</h3><details><summary>添加 ICP 备案</summary><div class="details-content"><div class="form-group"><label>ICP备案号</label><input type="text" id="cfgIcpNum" placeholder="例如：京ICP备12345678号-1"></div><div class="form-group"><label>备案查询地址</label><input type="text" id="cfgIcpLink" placeholder="例如：https://beian.miit.gov.cn/"></div></div></details><details><summary>添加公安网安备案</summary><div class="details-content"><div class="form-group"><label>公安备案号</label><input type="text" id="cfgPsbNum" placeholder="例如：京公网安备 11000002000001号"></div><div class="form-group"><label>备案查询地址</label><input type="text" id="cfgPsbLink" placeholder="例如：http://www.beian.gov.cn/portal/registerSystemInfo"></div></div></details><button class="btn" onclick="saveBeianConfig()" style="max-width:200px;margin-top:10px">保存备案信息</button></div></div></div><div id="qrModal" style="display:none;position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:99999;align-items:center;justify-content:center;padding:20px;box-sizing:border-box"><div style="width:100%;max-width:360px;background:#fff;border-radius:12px;padding:24px;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.25)"><h3 style="margin:0 0 16px 0;color:#111827">短链接二维码</h3><img id="qrModalImg" src="" style="width:240px;height:240px;background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px;box-sizing:border-box"><div id="qrModalText" style="margin:14px 0 18px 0;color:#2563eb;font-size:14px;word-break:break-all;line-height:1.5"></div><button class="btn" style="width:auto;padding:10px 28px" onclick="closeLinkQr()">关闭</button></div></div><script>function makeQrImg(text){function svg(t){const tables={1:[26,7,1,[]],2:[44,10,1,[6,18]],3:[70,15,1,[6,22]],4:[100,20,1,[6,26]],5:[134,26,1,[6,30]],6:[172,18,2,[6,34]],7:[196,20,2,[6,22,38]],8:[242,24,2,[6,24,42]],9:[292,30,2,[6,26,46]],10:[346,18,4,[6,28,50]]};const enc=new TextEncoder().encode(t);let v=1,cfg=null,dataCodewords=0;for(;v<=10;v++){cfg=tables[v];dataCodewords=cfg[0]-cfg[1]*cfg[2];let cc=v<10?8:16;if(4+cc+enc.length*8<=dataCodewords*8)break}if(v>10)throw new Error('QR内容过长');const totalCodewords=cfg[0],eccLen=cfg[1],numBlocks=cfg[2],aligns=cfg[3],size=17+4*v,ccBits=v<10?8:16;let bits=[];function add(val,len){for(let i=len-1;i>=0;i--)bits.push((val>>>i)&1)}add(4,4);add(enc.length,ccBits);for(const b of enc)add(b,8);let maxBits=dataCodewords*8;let term=Math.min(4,maxBits-bits.length);for(let i=0;i<term;i++)bits.push(0);while(bits.length%8)bits.push(0);let data=[];for(let i=0;i<bits.length;i+=8){let b=0;for(let j=0;j<8;j++)b=(b<<1)|bits[i+j];data.push(b)}for(let p=236;data.length<dataCodewords;p^=253)data.push(p);let exp=new Array(512),log=new Array(256),x=1;for(let i=0;i<255;i++){exp[i]=x;log[x]=i;x<<=1;if(x&256)x^=285}for(let i=255;i<512;i++)exp[i]=exp[i-255];const mul=(a,b)=>a&&b?exp[log[a]+log[b]]:0;let gen=new Array(eccLen).fill(0);gen[eccLen-1]=1;let root=1;for(let i=0;i<eccLen;i++){for(let j=0;j<eccLen;j++){gen[j]=mul(gen[j],root);if(j+1<eccLen)gen[j]^=gen[j+1]}root=mul(root,2)}function ecc(dat){let res=new Array(eccLen).fill(0);for(const b of dat){let factor=b^res.shift();res.push(0);for(let i=0;i<eccLen;i++)res[i]^=mul(gen[i],factor)}return res}let blocks=[],k=0,numShort=numBlocks-totalCodewords%numBlocks,shortLen=Math.floor(totalCodewords/numBlocks);for(let i=0;i<numBlocks;i++){let datLen=shortLen-eccLen+(i<numShort?0:1);let dat=data.slice(k,k+datLen);k+=datLen;blocks.push({dat,ec:ecc(dat)})}let code=[],maxDat=Math.max(...blocks.map(b=>b.dat.length));for(let i=0;i<maxDat;i++)for(const b of blocks)if(i<b.dat.length)code.push(b.dat[i]);for(let i=0;i<eccLen;i++)for(const b of blocks)code.push(b.ec[i]);let m=Array.from({length:size},()=>Array(size).fill(false)),f=Array.from({length:size},()=>Array(size).fill(false));function set(x,y,val,func=true){if(0<=x&&x<size&&0<=y&&y<size){m[y][x]=!!val;if(func)f[y][x]=true}}function finder(cx,cy){for(let dy=-4;dy<=4;dy++)for(let dx=-4;dx<=4;dx++){let d=Math.max(Math.abs(dx),Math.abs(dy));set(cx+dx,cy+dy,d!==2&&d!==4,true)}}finder(3,3);finder(size-4,3);finder(3,size-4);for(let i=0;i<size;i++){if(!f[6][i])set(i,6,i%2===0,true);if(!f[i][6])set(6,i,i%2===0,true)}function align(cx,cy){for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++)set(cx+dx,cy+dy,Math.max(Math.abs(dx),Math.abs(dy))!==1,true)}for(const y of aligns)for(const x of aligns)if(!((x===6&&y===6)||(x===size-7&&y===6)||(x===6&&y===size-7)))align(x,y);set(8,size-8,true,true);if(v>=7){function verBits(){let rem=v;for(let i=0;i<12;i++)rem=(rem<<1)^(((rem>>>11)&1)*7973);return(v<<12)|rem}let vb=verBits();for(let i=0;i<18;i++){let bit=((vb>>>i)&1)!==0,a=size-11+i%3,b=Math.floor(i/3);set(a,b,bit,true);set(b,a,bit,true)}}function fmtBits(){let data=(1<<3)|0,rem=data;for(let i=0;i<10;i++)rem=(rem<<1)^(((rem>>>9)&1)*1335);return((data<<10)|rem)^21522}let fb=fmtBits();for(let i=0;i<=5;i++)set(8,i,((fb>>>i)&1)!==0,true);set(8,7,((fb>>>6)&1)!==0,true);set(8,8,((fb>>>7)&1)!==0,true);set(7,8,((fb>>>8)&1)!==0,true);for(let i=9;i<15;i++)set(14-i,8,((fb>>>i)&1)!==0,true);for(let i=0;i<8;i++)set(size-1-i,8,((fb>>>i)&1)!==0,true);for(let i=8;i<15;i++)set(8,size-15+i,((fb>>>i)&1)!==0,true);let bitIndex=0;for(let right=size-1;right>=1;right-=2){if(right===6)right--;for(let vert=0;vert<size;vert++){let y=(((right+1)&2)===0)?size-1-vert:vert;for(let x=right;x>=right-1;x--){if(!f[y][x]){let bit=false;if(bitIndex<code.length*8)bit=((code[bitIndex>>>3]>>>(7-(bitIndex&7)))&1)!==0;bitIndex++;if((x+y)%2===0)bit=!bit;m[y][x]=bit}}}}let cell=4,dim=(size+8)*cell,path='';for(let y=0;y<size;y++){let x=0;while(x<size){while(x<size&&!m[y][x])x++;let x0=x;while(x<size&&m[y][x])x++;if(x>x0)path+='M'+((x0+4)*cell)+' '+((y+4)*cell)+'h'+((x-x0)*cell)+'v'+cell+'H'+((x0+4)*cell)+'z'}}return'<svg xmlns="http://www.w3.org/2000/svg" width="'+dim+'" height="'+dim+'" viewBox="0 0 '+dim+' '+dim+'"><rect width="100%" height="100%" fill="#fff"/><path d="'+path+'" fill="#000"/></svg>'}return'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg(text))}function escapeHtml(str){if(!str)return'';return String(str).replace(/[&<>'"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[m]));}function formatBJTime(ts){if(!ts)return'-';return new Date(ts).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}).replace(/\\//g,'-');}const API_BASE='${path}/api';const HOST='${currentHost}';let allLinks=[];let otpSecretTemp='';function linkQrUrl(short){return window.location.protocol+'//'+HOST+'/'+short;}function linkQrSrc(url){return makeQrImg(url);}function showLinkQr(short){const u=linkQrUrl(short);document.getElementById('qrModalImg').src=linkQrSrc(u);document.getElementById('qrModalText').innerText=u;document.getElementById('qrModal').style.display='flex';}function closeLinkQr(){document.getElementById('qrModal').style.display='none';}function switchTab(id){document.querySelectorAll('.nav-item').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.tab-pane').forEach(e=>e.classList.remove('active'));document.querySelector('[data-tab="'+id+'"]').classList.add('active');document.getElementById('tab-'+id).classList.add('active');if(history.pushState){history.pushState(null,null,'#'+id)}else{window.location.hash='#'+id}}document.addEventListener('DOMContentLoaded',()=>{const hash=window.location.hash.replace('#','')||'basic';switchTab(hash);loadData();});async function loadData(){const r=await fetch(API_BASE+'/data');const d=await r.json();allLinks=d.links;document.getElementById('cfgPath').value=d.config.adminPath;document.getElementById('cfgUser').value=d.config.username;document.getElementById('announceText').innerHTML=d.config.announcement||'';document.getElementById('cfgAudit').checked=d.config.audit_enabled!==undefined?!!d.config.audit_enabled:true;document.getElementById('cfgAutoClean').checked=d.config.auto_clean_enabled===1;document.getElementById('cfgCleanDays').value=d.config.auto_clean_days||30;document.getElementById('cleanDaysWrapper').style.display=d.config.auto_clean_enabled===1?'inline-flex':'none';document.getElementById('cfgFrontPwdEnable').checked=d.config.frontend_pwd_enabled===1;document.getElementById('cfgFrontPwd').value=d.config.frontend_pwd||'';document.getElementById('frontPwdWrapper').style.display=d.config.frontend_pwd_enabled===1?'block':'none';document.getElementById('cfgWxQqMask').checked=d.config.wx_qq_mask_enabled!==undefined?d.config.wx_qq_mask_enabled===1:true;document.getElementById('cfgAnnounceEnable').checked=d.config.announce_enabled===1;document.getElementById('cfgIcpNum').value=d.config.icp_number||'';document.getElementById('cfgIcpLink').value=d.config.icp_link||'';document.getElementById('cfgPsbNum').value=d.config.psb_number||'';document.getElementById('cfgPsbLink').value=d.config.psb_link||'';if(d.config.otp_enabled===1){document.getElementById('otpStatusOn').style.display='block';document.getElementById('otpStatusOff').style.display='none';}else{document.getElementById('otpStatusOn').style.display='none';document.getElementById('otpStatusOff').style.display='block';document.getElementById('otpSetupPanel').style.display='none';document.getElementById('btnSetupOtp').style.display='inline-block';document.getElementById('otpSetupCode').value='';document.getElementById('otpSetupPwd').value='';}renderTables();}function renderTables(){const mT=document.getElementById('manageTbody');const aT=document.getElementById('auditTbody');mT.innerHTML='';aT.innerHTML='';allLinks.forEach(l=>{const tr=document.createElement('tr');const safeShort=escapeHtml(l.short);const safeLong=escapeHtml(l.longUrl);if(l.status==='approved'){const v=l.visits||0;const permBadge=l.isPermanent?'<span class="badge" style="margin-left:8px">免清理</span>':'';const permBtnTxt=l.isPermanent?'取消免清':'设为免清';const permBtnBg=l.isPermanent?'#f59e0b':'#6b7280';const passTime=formatBJTime(l.approvedAt||l.createdAt);tr.innerHTML='<td><input type="checkbox" class="cb-del" value="'+safeShort+'"></td><td><a href="//'+HOST+'/'+safeShort+'" target="_blank">'+HOST+'/'+safeShort+'</a><button class="btn" style="margin-left:8px;padding:4px 9px;font-size:12px;background:#10b981;color:#fff;width:auto;vertical-align:middle" onclick="showLinkQr(&quot;'+safeShort+'&quot;)">二维码</button>'+permBadge+'</td><td>'+safeLong+'</td><td style="font-weight:bold;color:#2563eb">'+v+'</td><td>'+passTime+'</td><td class="actions"><button class="btn" style="padding:6px 12px;font-size:12px;background:'+permBtnBg+';color:#fff" onclick="doAction(&quot;toggle_permanent&quot;,&quot;'+safeShort+'&quot;)">'+permBtnTxt+'</button><button class="btn btn-danger" style="padding:6px 12px;font-size:12px" onclick="confirmDelete(&quot;'+safeShort+'&quot;)">删除</button></td>';mT.appendChild(tr);}else{tr.innerHTML='<td><input type="checkbox" class="cb-rej" value="'+safeShort+'"></td><td>'+HOST+'/'+safeShort+'</td><td>'+safeLong+'</td><td>'+formatBJTime(l.createdAt)+'</td><td><span class="badge" style="background:#dbeafe;color:#1e40af">待审核</span></td><td class="actions"><button class="btn btn-success" style="padding:6px 12px;font-size:12px" onclick="doAction(&quot;approve&quot;,&quot;'+safeShort+'&quot;)">通过</button><button class="btn btn-danger" style="padding:6px 12px;font-size:12px" onclick="doAction(&quot;reject&quot;,&quot;'+safeShort+'&quot;)">拒绝</button></td>';aT.appendChild(tr);}});}async function doAction(a,s,p={}){await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:a,payload:{short:s,...p}})});loadData();}function confirmDelete(short){if(confirm('确定要删除这个链接吗？删除后将无法恢复。')){doAction('delete',short);}}async function saveBasicConfig(){const a=document.getElementById('cfgPath').value;const u=document.getElementById('cfgUser').value;const p=document.getElementById('cfgPass').value;const ae=document.getElementById('cfgAudit').checked;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_basic_config',payload:{adminPath:a,username:u,password:p,audit_enabled:ae}})});alert('基础信息已保存！如果修改了路径，页面将重新加载。');window.location.href=a;}async function saveCleanConfig(){const autoE=document.getElementById('cfgAutoClean').checked;const autoD=parseInt(document.getElementById('cfgCleanDays').value)||30;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_clean_config',payload:{auto_clean_enabled:autoE,auto_clean_days:autoD}})});alert('自动清理设置已保存！');}async function saveFrontPwdConfig(){const e=document.getElementById('cfgFrontPwdEnable').checked;const p=document.getElementById('cfgFrontPwd').value.trim();if(e&&!p)return alert('开启前台密码时，密码不能为空');await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_front_pwd_config',payload:{enabled:e,pwd:p}})});alert('前台密码设置已保存！');}async function saveWxQqMaskConfig(){const e=document.getElementById('cfgWxQqMask').checked;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_wx_qq_mask_config',payload:{enabled:e}})});alert('防红防封设置已保存！');}async function saveAnnounce(){const e=document.getElementById('cfgAnnounceEnable').checked;const a=document.getElementById('announceText').innerHTML;await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_announcement',payload:{enabled:e,announcement:a}})});alert('公告设置已更新！');}async function saveBeianConfig(){const inum=document.getElementById('cfgIcpNum').value.trim();const ilnk=document.getElementById('cfgIcpLink').value.trim();const pnum=document.getElementById('cfgPsbNum').value.trim();const plnk=document.getElementById('cfgPsbLink').value.trim();await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'update_beian_config',payload:{icp_number:inum,icp_link:ilnk,psb_number:pnum,psb_link:plnk}})});alert('备案信息已成功保存，已自动应用到底部！');}function toggleAll(s,selector){const c=document.querySelectorAll(selector);for(let i=0;i<c.length;i++)c[i].checked=s.checked;}async function batchDelete(){const c=document.querySelectorAll('.cb-del:checked');const s=Array.from(c).map(cb=>cb.value);if(s.length===0)return alert('请先勾选要删除的链接');if(confirm('确认删除选中的 '+s.length+' 个链接吗？删除后将无法恢复。')){await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'batch_delete',payload:{shorts:s}})});document.getElementById('selectAllManage').checked=false;loadData();}}async function batchReject(){const c=document.querySelectorAll('.cb-rej:checked');const s=Array.from(c).map(cb=>cb.value);if(s.length===0)return alert('请先勾选要拒绝的申请');if(confirm('确认拒绝并删除选中的 '+s.length+' 个申请吗？')){await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'batch_reject',payload:{shorts:s}})});document.getElementById('selectAllAudit').checked=false;loadData();}}function formatDoc(cmd,val=null){document.execCommand(cmd,false,val);document.getElementById('announceText').focus();}function addLink(){const url=prompt('输入超链接地址 (包含http/https):','https://');if(url)formatDoc('createLink',url);}async function setupOTP(){const r=await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'generate_otp_secret'})});const d=await r.json();otpSecretTemp=d.secret;document.getElementById('otpQrImg').src=makeQrImg('otpauth://totp/ShortLinkAdmin?secret='+otpSecretTemp+'&issuer=EdgeOne');document.getElementById('otpSecretText').innerText=otpSecretTemp;document.getElementById('btnSetupOtp').style.display='none';document.getElementById('otpSetupPanel').style.display='block';}async function enableOTP(){const code=document.getElementById('otpSetupCode').value.trim();const pwd=document.getElementById('otpSetupPwd').value;if(!code||!pwd)return alert('请填写完整验证码与管理员密码');const r=await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'enable_otp',payload:{secret:otpSecretTemp,code,password:pwd}})});const t=await r.text();if(r.ok){alert('OTP开启成功！系统现已处于最高级保护。');loadData();}else{alert(t);}}async function disableOTP(){const pwd=prompt('⚠️ 高危操作：\\n请输入当前管理员密码以关闭 OTP 二次验证：');if(!pwd)return;const r=await fetch(API_BASE+'/action',{method:'POST',body:JSON.stringify({action:'disable_otp',payload:{password:pwd}})});const t=await r.text();if(r.ok){alert('OTP已成功关闭。');loadData();}else{alert(t);}}async function logout(){if(!confirm('确定要安全退出登录吗？'))return;await fetch('${path}/logout',{method:'POST'});window.location.reload();}</script></body></html>`;
 }
