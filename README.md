@@ -2,6 +2,7 @@
 本系统基于 EdgeOne Pages / Cloudflare Pages + KV Storage 搭建，无需服务器和数据库，开箱即用。
 
 🔗 **演示地址：** [https://i.l42.cn](https://i.l42.cn)
+
 🌐 **博主博客：** [https://www.l42.cn](https://www.l42.cn)
 
 ## 功能说明
@@ -19,7 +20,7 @@
 ## EdgeOne Pages 部署
 1. 导入 Git 仓库。
 2. 使用自动识别到的构建配置即可；如果没有自动带出，可直接使用：
-   - 框架预设：按控制台自动识别，或保持默认，如果没有自动识别选择'Other"
+   - 框架预设：按控制台自动识别，或保持默认，如果没有自动识别选择 `Other`
    - 根目录：`./`
    - 输出目录：`./`
    - 构建命令：留空
@@ -38,8 +39,8 @@
 4. 部署完成后首次访问站点，按页面提示初始化后台路径、管理员账号和密码。
 
 ## Cloudflare Worker 部署
-- D1 数据库名称：duanlianjie
-- Worker 绑定变量名：DB
+- D1 数据库名称：`duanlianjie`
+- Worker 绑定变量名：`DB`
 
 ```sql
 CREATE TABLE IF NOT EXISTS system_config (
@@ -72,3 +73,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
+```
+
+## 说明
+- 这份仓库已经同时包含 EdgeOne Pages 和 Cloudflare Pages 所需目录。
+- EdgeOne Pages 读取 `edge-functions/`。
+- Cloudflare Pages 读取根目录 `functions/`，静态输出目录使用 `public/`。
+- 两个平台功能、页面、后台界面保持一致。
