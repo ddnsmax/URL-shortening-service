@@ -82,7 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
 
 ## 说明
 
-- 这份仓库已经同时包含 EdgeOne Pages 和 Cloudflare Pages 所需目录。
+- 这份仓库已经同时包含 EdgeOne Pages 和 Cloudflare Pages 所需目录
 - EdgeOne Pages 读取 `edge-functions/`。
 - Cloudflare Pages 读取根目录 `functions/`，静态输出目录使用 `public/`。
 - 两个平台功能、页面、后台界面保持一致。
