@@ -1,13 +1,10 @@
 # 极简短链接生成源码
-
 本系统基于 EdgeOne Pages / Cloudflare Pages + KV Storage 搭建，无需服务器和数据库，开箱即用。
 
 🔗 **演示地址：** [https://i.l42.cn](https://i.l42.cn)
-
 🌐 **博主博客：** [https://www.l42.cn](https://www.l42.cn)
 
 ## 功能说明
-
 - 防封与防抓取：自动识别微信、QQ 等内置浏览器环境，动态渲染防封引导遮罩，隐藏真实跳转信息。
 - 智能自动清理：支持按天数自动清理长期未访问短链，并可为重要链接设置免清理。
 - OTP 二次验证：后台支持 TOTP 动态验证码。
@@ -15,13 +12,11 @@
 - 数据与链路管理：支持自定义短链、跳转统计、单条或批量删除、公告板管理。
 
 ## 目录说明
-
 - `edge-functions/`：EdgeOne Pages 使用
 - `functions/`：Cloudflare Pages 使用
 - `public/`：Cloudflare Pages 静态输出目录
 
 ## EdgeOne Pages 部署
-
 1. 导入 Git 仓库。
 2. 使用自动识别到的构建配置即可；如果没有自动带出，可直接使用：
    - 框架预设：按控制台自动识别，或保持默认，如果没有自动识别选择'Other"
@@ -33,7 +28,6 @@
 4. 部署完成后首次访问站点，按页面提示初始化后台路径、管理员账号和密码。
 
 ## Cloudflare Pages 部署
-
 1. 进入 Workers & Pages，选择 Pages，连接 Git 仓库。
 2. 构建设置按下面填写：
    - 框架预设：`无`
@@ -44,10 +38,11 @@
 4. 部署完成后首次访问站点，按页面提示初始化后台路径、管理员账号和密码。
 
 ## Cloudflare Worker 部署
-D1 数据库名称：duanlianjie
-Worker 绑定变量名：DB
+- D1 数据库名称：duanlianjie
+- Worker 绑定变量名：DB
 
-`CREATE TABLE IF NOT EXISTS system_config (
+```sql
+CREATE TABLE IF NOT EXISTS system_config (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
@@ -76,7 +71,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   PRIMARY KEY (type, token)
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);`
+CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
 
 ## 说明
 
