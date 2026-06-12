@@ -47,7 +47,7 @@
 D1 数据库名称：duanlianjie
 Worker 绑定变量名：DB
 
-CREATE TABLE IF NOT EXISTS system_config (
+`CREATE TABLE IF NOT EXISTS system_config (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   PRIMARY KEY (type, token)
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
+CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);`
 
 ## 说明
 
