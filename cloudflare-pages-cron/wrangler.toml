@@ -1,0 +1,6 @@
+name = "url-shortening-pages-pending-cleanup"
+main = "worker.js"
+compatibility_date = "2026-06-23"
+
+[triggers]
+crons = ["0 18 * * *"]

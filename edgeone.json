@@ -1,0 +1,14 @@
+{
+  "schedules": [
+    {
+      "name": "pending-cleanup",
+      "cron": "0 2 * * *",
+      "path": "/_system_pending_cleanup_ced3b82772603174",
+      "method": "POST",
+      "payload": {
+        "token": "ced3b82772603174c122b024f7448af1e0ac36e54cfd93d77aceb6f971f88d14"
+      },
+      "timezone": "Asia/Shanghai"
+    }
+  ]
+}
