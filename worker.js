@@ -10,7 +10,12 @@ export default {
     }
   },
   async scheduled(controller, env, ctx) {
-    await cleanupExpiredPendingD1(env);
+    const jobs = [cleanupExpiredPendingD1(env)];
+    if (env && env.EDGEONE_CLEANUP_URL) jobs.push(triggerRemotePendingCleanup(env.EDGEONE_CLEANUP_URL, env.CLEANUP_TOKEN));
+    if (env && env.PAGES_CLEANUP_URL) jobs.push(triggerRemotePendingCleanup(env.PAGES_CLEANUP_URL, env.CLEANUP_TOKEN));
+    const results = await Promise.allSettled(jobs);
+    const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (errors.length) throw new Error(errors.map(error => String(error && (error.stack || error.message) || error)).join(' | '));
   }
 };
 
@@ -310,6 +315,34 @@ function normalizeCleanupDays(value, fallback = 30) {
   return Math.min(3650, Math.max(1, parsed));
 }
 
+function normalizeCleanupUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const url = new URL(raw);
+  const suffix = '/api/internal/pending-cleanup';
+  if (!url.pathname.endsWith(suffix)) url.pathname = url.pathname.replace(/\/+$/, '') + suffix;
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+async function triggerRemotePendingCleanup(value, token) {
+  const url = normalizeCleanupUrl(value);
+  const cleanupToken = String(token || '').trim();
+  if (!url || !cleanupToken) throw new Error('远程清理地址或 CLEANUP_TOKEN 未配置');
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + cleanupToken,
+      'Content-Type': 'application/json'
+    },
+    body: '{}'
+  });
+  const body = await response.text();
+  if (!response.ok) throw new Error(url + '：' + response.status + ' ' + body);
+  return body;
+}
+
 async function cleanupExpiredPendingD1(env) {
   const db = env && (env.DB || env.duanlianjie);
   if (!db) return;
@@ -320,7 +353,7 @@ async function cleanupExpiredPendingD1(env) {
   if (!config || config.pending_auto_clean_enabled !== 1) return;
   const days = normalizeCleanupDays(config.pending_auto_clean_days, 30);
   const cutoff = Date.now() - days * 86400000;
-  await db.prepare("DELETE FROM links WHERE short IN (SELECT short FROM links WHERE status = 'pending' AND created_at <= ? ORDER BY created_at ASC LIMIT 200)").bind(cutoff).run();
+  await db.prepare("DELETE FROM links WHERE status = 'pending' AND created_at <= ?").bind(cutoff).run();
 }
 
 async function handleRequest(context) {

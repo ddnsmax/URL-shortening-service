@@ -9,11 +9,21 @@ function resolveKvBinding(context) {
   return null;
 }
 
+function resolveTextBinding(context, name) {
+  const contextValue = context && context.env && context.env[name];
+  if (contextValue !== undefined && contextValue !== null) return String(contextValue).trim();
+  const globalValue = globalThis && globalThis[name];
+  if (globalValue !== undefined && globalValue !== null) return String(globalValue).trim();
+  try {
+    if (typeof env !== 'undefined' && env && env[name] !== undefined && env[name] !== null) return String(env[name]).trim();
+  } catch (e) {}
+  return '';
+}
+
 const qx0 = ['4f40132230b55be7b640ea11608cf7c2ff35177f136c0f9cd6ff9f291b32444f','b8ef71958392ef4f5f5474d3cdd24da9f9cced19c253a37970a56d8767287788','be54ea75dda3c33f52a1b3ef759eeecdad8556bbb0fe40898f5c81fc0ec87dc4'];
 const qx1 = ['f4d2','a9c7','k8m1'];
 const qx2 = [79,59,87,86,84,54,82,55,60,79,54,89,88,86,81,80].map((v,i)=>String.fromCharCode(v-(i%5+3))).join('');
 const GLOBAL_ACCESS_KEY = 'global_shortlink_access_stopped';
-const PENDING_CLEANUP_TOKEN = 'ced3b82772603174c122b024f7448af1e0ac36e54cfd93d77aceb6f971f88d14';
 
 const qx4 = [108, 121, 122, 119, 123, 67, 57, 51, 122, 120, 115, 53, 124, 114, 115, 119, 122, 108, 118, 114, 120, 107, 50, 121, 108, 122, 127, 115, 103, 106, 52, 126, 119, 59, 67, 50, 104, 117, 116, 55, 106, 122, 109, 52, 120, 108, 120, 120, 124, 120];
 const qx5 = [60, 105, 106, 110, 67, 68, 64, 60, 62, 105, 111, 62, 110, 111, 62, 55, 56, 59, 58, 67, 69, 60, 58, 60, 109, 65, 110, 112, 107, 105, 107, 62, 63, 59, 109, 54, 64, 110, 111, 60, 110, 66, 54, 59, 107, 111, 67, 59, 110, 58, 107, 106, 108, 107, 61, 67, 61, 106, 63, 110, 112, 65, 63, 55];
@@ -193,10 +203,10 @@ async function handleRequest(context) {
   let configStr = await kv.get('system_config');
   let config = configStr ? JSON.parse(configStr) : null;
 
-  if (path === '/_system_pending_cleanup_ced3b82772603174' && request.method === 'POST') {
-    let data = {};
-    try { data = await request.json(); } catch (e) {}
-    if (data.token !== PENDING_CLEANUP_TOKEN) return textResponse('Forbidden', 403);
+  if (path === '/api/internal/pending-cleanup' && request.method === 'POST') {
+    const cleanupToken = resolveTextBinding(context, 'CLEANUP_TOKEN');
+    if (!cleanupToken) return textResponse('CLEANUP_TOKEN 未配置', 503);
+    if ((request.headers.get('Authorization') || '') !== 'Bearer ' + cleanupToken) return textResponse('Forbidden', 403);
     if (!config) return jsonResponse({ status: 'not_initialized', scanned: 0, deleted: [], failed: [] }, 200);
     const result = await cleanupExpiredPendingKv(kv, config);
     return jsonResponse(result, result.failed && result.failed.length ? 207 : 200);

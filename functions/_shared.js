@@ -9,6 +9,17 @@ function resolveKvBinding(context) {
   return null;
 }
 
+function resolveTextBinding(context, name) {
+  const contextValue = context && context.env && context.env[name];
+  if (contextValue !== undefined && contextValue !== null) return String(contextValue).trim();
+  const globalValue = globalThis && globalThis[name];
+  if (globalValue !== undefined && globalValue !== null) return String(globalValue).trim();
+  try {
+    if (typeof env !== 'undefined' && env && env[name] !== undefined && env[name] !== null) return String(env[name]).trim();
+  } catch (e) {}
+  return '';
+}
+
 const qx0 = ['4f40132230b55be7b640ea11608cf7c2ff35177f136c0f9cd6ff9f291b32444f','b8ef71958392ef4f5f5474d3cdd24da9f9cced19c253a37970a56d8767287788','be54ea75dda3c33f52a1b3ef759eeecdad8556bbb0fe40898f5c81fc0ec87dc4'];
 const qx1 = ['f4d2','a9c7','k8m1'];
 const qx2 = [79,59,87,86,84,54,82,55,60,79,54,89,88,86,81,80].map((v,i)=>String.fromCharCode(v-(i%5+3))).join('');
@@ -191,6 +202,15 @@ async function handleRequest(context) {
 
   let configStr = await kv.get('system_config');
   let config = configStr ? JSON.parse(configStr) : null;
+
+  if (path === '/api/internal/pending-cleanup' && request.method === 'POST') {
+    const cleanupToken = resolveTextBinding(context, 'CLEANUP_TOKEN');
+    if (!cleanupToken) return textResponse('CLEANUP_TOKEN 未配置', 503);
+    if ((request.headers.get('Authorization') || '') !== 'Bearer ' + cleanupToken) return textResponse('Forbidden', 403);
+    if (!config) return jsonResponse({ status: 'not_initialized', scanned: 0, deleted: [], failed: [] }, 200);
+    const result = await cleanupExpiredPendingKv(kv, config);
+    return jsonResponse(result, result.failed && result.failed.length ? 207 : 200);
+  }
 
   if (!config) {
     if (path === '/api/init' && request.method === 'POST') {
