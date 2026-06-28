@@ -328,6 +328,7 @@ async function handleRequest(context) {
     if (!isAuthenticated) return htmlResponse(getLoginHtml(config.adminPath));
 
     if (path === config.adminPath + '/api/data') {
+      await cleanupExpiredPendingKv(kv, config);
       const keys = await getLinkKeys(kv);
       const links = [];
       const now = Date.now();
@@ -615,6 +616,7 @@ async function getLocalData(kv, config) {
     frontend_pwd: '',
     wx_qq_mask_enabled: 1
   };
+  await cleanupExpiredPendingKv(kv, config);
   const keys = await getLinkKeys(kv);
   const links = [];
   const now = Date.now();
@@ -793,20 +795,10 @@ async function cleanupExpiredPendingKv(kv, config) {
   const days = normalizeCleanupDays(config.pending_auto_clean_days, 30);
   const cutoff = Date.now() - days * 86400000;
   const keys = await getLinkKeys(kv);
-  if (keys.length === 0) {
-    try { await kv.delete('pending_cleanup_cursor'); } catch (e) {}
-    return { status: 'ok', scanned: 0, deleted: [], failed: [] };
-  }
-  let cursor = null;
-  try { cursor = await kv.get('pending_cleanup_cursor'); } catch (e) {}
-  let start = cursor ? keys.indexOf(cursor) : 0;
-  if (start < 0) start = 0;
-  const maxScan = Math.min(keys.length, 500);
   const deleted = [];
   const failed = [];
   let scanned = 0;
-  for (let i = 0; i < maxScan && deleted.length < 200; i++) {
-    const key = keys[(start + i) % keys.length];
+  for (const key of keys) {
     scanned++;
     try {
       const value = await kv.get('short_link:' + key);
@@ -821,21 +813,7 @@ async function cleanupExpiredPendingKv(kv, config) {
     }
   }
   if (deleted.length > 0) await updateLinkIndexAfterDeletes(kv, deleted);
-  const removed = new Set(deleted);
-  let nextCursor = '';
-  if (scanned < keys.length) {
-    for (let i = 0; i < keys.length; i++) {
-      const candidate = keys[(start + scanned + i) % keys.length];
-      if (!removed.has(candidate)) {
-        nextCursor = candidate;
-        break;
-      }
-    }
-  }
-  try {
-    if (nextCursor) await kv.put('pending_cleanup_cursor', nextCursor);
-    else await kv.delete('pending_cleanup_cursor');
-  } catch (e) {}
+  try { await kv.delete('pending_cleanup_cursor'); } catch (e) {}
   return { status: failed.length ? 'partial' : 'ok', scanned, deleted, failed };
 }
 
