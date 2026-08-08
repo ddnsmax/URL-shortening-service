@@ -37,6 +37,31 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>'"]/g, match => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[match]));
 }
 
+function normalizeTargetUrl(value) {
+  const candidate = String(value ?? '').trim();
+  if (!candidate) throw new Error('目标地址不能为空');
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch (error) {
+    throw new Error('目标地址必须是有效的 HTTP 或 HTTPS 地址');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('目标地址必须是有效的 HTTP 或 HTTPS 地址');
+  return parsed.href;
+}
+
+async function updateApprovedLinkTarget(store, short, longUrl) {
+  if (typeof store.updateApprovedLinkTarget === 'function') return await store.updateApprovedLinkTarget(short, longUrl);
+  const key = 'short_link:' + short;
+  const value = await store.get(key);
+  if (!value) return false;
+  const link = JSON.parse(value);
+  if (link.status !== 'approved') return false;
+  link.longUrl = longUrl;
+  await store.put(key, JSON.stringify(link));
+  return true;
+}
+
 function base32tohex(base32) {
   let base32chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
   let bits = "";
@@ -228,20 +253,15 @@ async function handleRequest(context) {
     if (request.method === 'GET' && adminSuffix === '/api/audit/data') return jsonResponse({ links: await loadAdminLinks(kv, config, 'pending') });
     if (request.method === 'GET' && adminSuffix === '/api/announcement/data') return jsonResponse({ announce_enabled: config.announce_enabled, announcement: config.announcement || '' });
     if (request.method === 'GET' && adminSuffix === '/api/filing/data') return jsonResponse({ icp_number: config.icp_number || '', icp_link: config.icp_link || '', psb_number: config.psb_number || '', psb_link: config.psb_link || '' });
-    if (path === config.adminPath + '/api/data') {
-      const links = await loadAdminLinks(kv, config);
-      return jsonResponse({ links, config: { ...config, password: '', otp_secret: '' } });
-    }
-
     const actionPage = ({ '/api/basic/action': 'basic', '/api/links/action': 'links', '/api/audit/action': 'audit', '/api/announcement/action': 'announcement', '/api/filing/action': 'filing' })[adminSuffix] || '';
-    const isActionRequest = path === config.adminPath + '/api/action' || Boolean(actionPage);
+    const isActionRequest = Boolean(actionPage);
     if (isActionRequest && request.method === 'POST') {
       const reqData = await request.json();
       const action = reqData.action;
       const payload = reqData.payload || {};
       const allowedActions = {
         basic: ['update_basic_config', 'update_front_pwd_config', 'update_wx_qq_mask_config', 'update_clean_config', 'generate_otp_secret', 'enable_otp', 'disable_otp'],
-        links: ['delete', 'batch_delete', 'toggle_permanent'],
+        links: ['delete', 'batch_delete', 'toggle_permanent', 'update_target_url'],
         audit: ['approve', 'reject', 'batch_reject'],
         announcement: ['update_announcement'],
         filing: ['update_beian_config']
@@ -299,6 +319,19 @@ async function handleRequest(context) {
         config.otp_enabled = 0;
         config.otp_secret = '';
         await kv.put('system_config', JSON.stringify(config));
+      }
+      else if (action === 'update_target_url') {
+        const short = String(payload.short || '').trim();
+        if (!short) return textResponse('短码不能为空', 400);
+        let longUrl;
+        try {
+          longUrl = normalizeTargetUrl(payload.longUrl);
+        } catch (error) {
+          return textResponse(error.message, 400);
+        }
+        const updated = await updateApprovedLinkTarget(kv, short, longUrl);
+        if (!updated) return textResponse('链接不存在或未通过审核', 404);
+        return jsonResponse({ status: 'ok', short, longUrl }, 200);
       }
       else if (action === 'approve') {
         const linkStr = await kv.get('short_link:' + payload.short);

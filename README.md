@@ -1,6 +1,6 @@
 # 极简短链接服务
 
-本项目同时支持 EdgeOne Makers、Cloudflare Pages 和 Cloudflare Worker，包含短链生成、人工审核、链接管理、访问统计、自动清理、前台密码、微信与 QQ 引导、OTP、公告和备案信息管理。
+本项目同时支持 EdgeOne Makers、Cloudflare Pages 和 Cloudflare Worker，包含短链生成、人工审核、目标地址编辑、链接管理、访问统计、自动清理、前台密码、微信与 QQ 引导、OTP、公告和备案信息管理。
 
 ## 平台目录
 
@@ -21,7 +21,7 @@
 - `/{后台路径}/announcement`
 - `/{后台路径}/filing`
 
-访问原后台根路径会跳转到 `/{后台路径}/basic`。每个菜单返回独立完整 HTML，只读取和处理本页面的数据。
+访问原后台根路径会跳转到 `/{后台路径}/basic`。每个菜单返回独立完整 HTML，只读取和处理本页面的数据。链接管理的已通过列表支持编辑目标地址，保存后短码不变。
 
 ## EdgeOne Makers 部署
 
@@ -33,11 +33,10 @@
    - 构建命令：留空
    - 安装命令：由 `edgeone.json` 固定为 `npm install`
    - Node.js：由 `edgeone.json` 固定为 `20.18.0`
-3. 新部署不要求创建 KV。系统使用名为 `duanlianjie` 的 Makers Blob，并对后台和短链数据执行强一致读取。
-4. 如果原项目已经绑定变量名为 `duanlianjie` 的 KV，请保留该绑定完成兼容迁移。Blob 中不存在数据时，程序会读取旧 KV 并迁移到 Blob。
-5. 首次访问站点，根据页面提示初始化后台路径、账号和密码。
+3. 不创建也不绑定 KV。系统只使用名为 `duanlianjie` 的 Makers Blob，并对后台和短链数据执行强一致读取。
+4. 首次访问站点，根据页面提示初始化后台路径、账号和密码。
 
-EdgeOne Makers 使用 `@edgeone/pages-blob`，依赖版本已经锁定在 `package-lock.json`。Blob 在 Makers Functions 内自动鉴权，不需要配置 API Token。
+EdgeOne Makers 使用 `@edgeone/pages-blob`，依赖版本已经锁定在 `package-lock.json`。名为 `duanlianjie` 的 Blob Store 在首次调用时自动创建，并在 Makers Functions 内自动鉴权，不需要配置 API Token。
 
 ## Cloudflare Pages 部署
 
