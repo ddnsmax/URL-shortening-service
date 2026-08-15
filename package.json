@@ -1,9 +1,0 @@
-{
-  "name": "url-shortening-service",
-  "version": "2.0.0",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@edgeone/pages-blob": "0.0.16"
-  }
-}

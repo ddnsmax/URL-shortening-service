@@ -1,63 +1,46 @@
-# 极简短链接服务
+# 极简短链接生成源码
+本系统基于 EdgeOne Pages / Cloudflare Pages + KV Storage 搭建，无需服务器和数据库，开箱即用。
 
-本项目同时支持 EdgeOne Makers、Cloudflare Pages 和 Cloudflare Worker，包含短链生成、人工审核、目标地址编辑、链接管理、访问统计、自动清理、前台密码、微信与 QQ 引导、OTP、公告和备案信息管理。
+🔗 **演示地址：** [https://i.l42.cn](https://i.l42.cn)
 
-## 平台目录
+🌐 **博主博客：** [https://www.l42.cn](https://www.l42.cn)
 
-- `edge-functions/`：EdgeOne Makers Edge Functions
-- `functions/`：Cloudflare Pages Functions
-- `public/`：Cloudflare Pages 输出目录
-- `worker.js`：Cloudflare Worker 入口
+## 功能说明
+- 防封与防抓取：自动识别微信、QQ 等内置浏览器环境，动态渲染防封引导遮罩，隐藏真实跳转信息。
+- 智能自动清理：支持按天数自动清理长期未访问短链，并可为重要链接设置免清理。
+- OTP 二次验证：后台支持 TOTP 动态验证码。
+- 人工审核流：可开启生成审核，新提交短链进入待审核队列。
+- 数据与链路管理：支持自定义短链、跳转统计、单条或批量删除、公告板管理。
 
-现有平台入口路径保持不变。`index.js`、动态 Catch-all 路由和 `_routes.json` 均保留。
+## 目录说明
+- `edge-functions/`：EdgeOne Pages 使用
+- `functions/`：Cloudflare Pages 使用
+- `public/`：Cloudflare Pages 静态输出目录
 
-## 后台页面
-
-后台已经改为独立多页面结构：
-
-- `/{后台路径}/basic`
-- `/{后台路径}/links`
-- `/{后台路径}/audit`
-- `/{后台路径}/announcement`
-- `/{后台路径}/filing`
-
-访问原后台根路径会跳转到 `/{后台路径}/basic`。每个菜单返回独立完整 HTML，只读取和处理本页面的数据。链接管理的已通过列表支持编辑目标地址，保存后短码不变。
-
-## EdgeOne Makers 部署
-
-1. 导入仓库。
-2. 使用以下构建配置：
-   - 框架预设：`Other`
+## EdgeOne Pages 部署
+1. 导入 Git 仓库。
+2. 使用自动识别到的构建配置即可；如果没有自动带出，可直接使用：
+   - 框架预设：按控制台自动识别，或保持默认，如果没有自动识别选择 `Other`
    - 根目录：`./`
    - 输出目录：`./`
    - 构建命令：留空
-   - 安装命令：由 `edgeone.json` 固定为 `npm install`
-   - Node.js：由 `edgeone.json` 固定为 `20.18.0`
-3. 不创建也不绑定 KV。系统只使用名为 `duanlianjie` 的 Makers Blob，并对后台和短链数据执行强一致读取。
-4. 首次访问站点，根据页面提示初始化后台路径、账号和密码。
-
-EdgeOne Makers 使用 `@edgeone/pages-blob`，依赖版本已经锁定在 `package-lock.json`。名为 `duanlianjie` 的 Blob Store 在首次调用时自动创建，并在 Makers Functions 内自动鉴权，不需要配置 API Token。
+   - 安装命令：留空
+3. 绑定 KV，变量名必须是 `duanlianjie`。
+4. 部署完成后首次访问站点，按页面提示初始化后台路径、管理员账号和密码。
 
 ## Cloudflare Pages 部署
-
-1. 在 Workers & Pages 中创建 Pages 项目并连接仓库。
-2. 使用以下构建配置：
-   - 框架预设：无
-   - 根目录：`./`
-   - 构建命令：留空；控制台要求必填时使用 `exit 0`
+1. 进入 Workers & Pages，选择 Pages，连接 Git 仓库。
+2. 构建设置按下面填写：
+   - 框架预设：`无`
+   - 构建命令：留空；如果控制台要求必填，填写 `exit 0`
    - 构建输出目录：`public`
-3. 创建并绑定 Workers KV，变量名必须为 `duanlianjie`。
-4. 生产环境和预览环境需要分别检查绑定。
-5. 重新部署后首次访问站点完成初始化。
+   - 根目录：留空或 `./`
+3. 在项目设置中绑定 KV，变量名必须是 `duanlianjie`。
+4. 部署完成后首次访问站点，按页面提示初始化后台路径、管理员账号和密码。
 
 ## Cloudflare Worker 部署
-
-将 `worker.js` 作为 ES Module Worker 部署，并绑定 D1：
-
 - D1 数据库名称：`duanlianjie`
 - Worker 绑定变量名：`DB`
-
-初始化 SQL：
 
 ```sql
 CREATE TABLE IF NOT EXISTS system_config (
@@ -92,14 +75,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
 ```
 
-## 可选自动清理
-
-EdgeOne Makers 和 Cloudflare Pages 可以配置 `CLEANUP_TOKEN`，通过 `POST /api/internal/pending-cleanup` 触发待审核数据清理。Cloudflare Worker 的计划任务还可以配置：
-
-- `EDGEONE_CLEANUP_URL`
-- `PAGES_CLEANUP_URL`
-- `CLEANUP_TOKEN`
-
-## 缓存策略
-
-动态 HTML、JSON、登录和操作响应均返回 `Cache-Control: no-store`。EdgeOne Makers 数据通过 Blob 强一致读取，避免旧 KV 边缘缓存导致后台需要重复刷新。
+## 说明
+- 这份仓库已经同时包含 EdgeOne Pages 和 Cloudflare Pages 所需目录。
+- EdgeOne Pages 读取 `edge-functions/`。
+- Cloudflare Pages 读取根目录 `functions/`，静态输出目录使用 `public/`。
+- 两个平台功能、页面、后台界面保持一致。

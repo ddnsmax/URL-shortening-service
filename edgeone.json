@@ -1,5 +1,0 @@
-{
-  "installCommand": "npm install",
-  "outputDirectory": "./",
-  "nodeVersion": "20.18.0"
-}
